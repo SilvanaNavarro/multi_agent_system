@@ -1,0 +1,10 @@
+env/
+development/
+__pycache__/
+*.pyc
+.env
+.env.*
+knowledge_*.json
+custom_modes.json
+custom_tools.json
+
