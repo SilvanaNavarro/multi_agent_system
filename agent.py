@@ -3,6 +3,8 @@ import os
 import re
 import subprocess
 import threading
+from dotenv import load_dotenv
+load_dotenv()
 
 # ============================================================
 # MODOS DEL AGENTE
@@ -118,7 +120,9 @@ def inicializar_cliente(backend):
     return None
 
 
-inicializar_cliente(BACKEND)
+_error_inicializacion = inicializar_cliente(BACKEND)
+if _error_inicializacion:
+    print(f"[Advertencia backend '{BACKEND}']: {_error_inicializacion}")
 
 
 # ============================================================
@@ -334,6 +338,28 @@ TOOLS = [
                 }
             },
             "required": ["consulta"]
+        }
+    },
+    {
+        "name": "buscar_en_proyecto",
+        "description": (
+            "Busca un término en TODOS los archivos del proyecto (HTML, CSS, JS, Python, etc.). "
+            "Devuelve archivo:línea:contenido para cada coincidencia. "
+            "Úsala SIEMPRE antes de diagnosticar un bug de UI — el error puede estar en CSS o HTML, no solo en JS."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "termino": {
+                    "type": "string",
+                    "description": "Texto a buscar, ej: 'prize-close-btn', 'openTrivia', 'z-index'"
+                },
+                "extension": {
+                    "type": "string",
+                    "description": "Filtrar por extensión, ej: '.css', '.js', '.html'. Omitir para buscar en todos."
+                }
+            },
+            "required": ["termino"]
         }
     },
     {
@@ -783,6 +809,40 @@ def _despachar_herramienta(nombre, inputs):
             for i in items
         )
 
+    if nombre == "buscar_en_proyecto":
+        if not RUTA_PROYECTO[0]:
+            return "No hay ruta de proyecto configurada. Llama solicitar_ruta_proyecto primero."
+        termino = inputs.get("termino", "").strip()
+        if not termino:
+            return "Se requiere 'termino'."
+        extension = inputs.get("extension", "").strip().lower()
+        base = os.path.abspath(RUTA_PROYECTO[0])
+        resultados = []
+        EXTENSIONES_TEXTO = {".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".py", ".json", ".md", ".txt", ".env", ".yaml", ".yml"}
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "node_modules"]
+            for fname in sorted(files):
+                if extension and not fname.endswith(extension):
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if not extension and ext not in EXTENSIONES_TEXTO:
+                    continue
+                fpath = os.path.join(root, fname)
+                rel = os.path.relpath(fpath, base)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        for i, line in enumerate(f, 1):
+                            if termino.lower() in line.lower():
+                                resultados.append(f"{rel}:{i}: {line.rstrip()}")
+                except OSError:
+                    pass
+        if not resultados:
+            return f"'{termino}' no encontrado en ningún archivo del proyecto."
+        if len(resultados) > 80:
+            resultados = resultados[:80]
+            resultados.append(f"[... resultado truncado a 80 líneas]")
+        return "\n".join(resultados)
+
     if nombre == "buscar_conocimiento":
         consulta = inputs.get("consulta", "").lower()
         entries = cargar_conocimiento(MODO_ACTUAL)
@@ -1025,6 +1085,71 @@ _historial: list = []
 _detener_agente = threading.Event()
 
 
+def compactar_historial():
+    global _historial
+
+    if not _historial:
+        return "Historial vacío."
+
+    fragmentos = []
+    for e in _historial[-30:]:
+        rol = e["role"].upper()
+        contenido = str(e.get("content") or "")[:400]
+        fragmentos.append(f"[{rol}]: {contenido}")
+    historial_texto = "\n".join(fragmentos)
+
+    prompt_resumen = (
+        "Resume esta conversación en máximo 250 palabras. "
+        "Incluye: (1) objetivo del usuario, (2) qué ya se creó o hizo, "
+        "(3) estado actual de la tarea, (4) decisiones o preferencias clave. "
+        "Solo el resumen, sin explicaciones adicionales.\n\n"
+        f"HISTORIAL:\n{historial_texto}"
+    )
+
+    resumen = None
+    try:
+        if BACKEND == "zhipu" and client:
+            resp = client.chat.completions.create(
+                model=MODELO,
+                messages=[{"role": "user", "content": prompt_resumen}],
+            )
+            resumen = resp.choices[0].message.content or ""
+        elif BACKEND == "anthropic" and client:
+            resp = client.messages.create(
+                model=MODELO, max_tokens=512,
+                messages=[{"role": "user", "content": prompt_resumen}]
+            )
+            resumen = resp.content[0].text if resp.content else ""
+        elif BACKEND == "ollama" and client:
+            resp = client.chat(
+                model=MODELO,
+                messages=[{"role": "user", "content": prompt_resumen}]
+            )
+            resumen = resp.message.content or ""
+    except Exception as e:
+        resumen = f"[Resumen automático falló: {e}]"
+
+    if not resumen:
+        resumen = "[Sin resumen generado]"
+
+    ruta_info = f"\nRuta del proyecto activa: {RUTA_PROYECTO[0]}" if RUTA_PROYECTO[0] else ""
+    modo_info = f"\nModo activo: {MODOS_ETIQUETAS.get(MODO_ACTUAL, MODO_ACTUAL)}"
+
+    contexto_compactado = (
+        f"[CONTEXTO PREVIO — conversación compactada]{modo_info}{ruta_info}\n\n"
+        f"{resumen}"
+    )
+
+    _historial.clear()
+    _historial.append({"role": "user", "content": contexto_compactado})
+    _historial.append({"role": "assistant", "content": "Contexto cargado. Continúo desde donde estábamos."})
+
+    return (
+        f"Historial compactado. Resumen: {len(resumen)} chars. "
+        f"Ruta preservada: {RUTA_PROYECTO[0] or 'ninguna'}"
+    )
+
+
 def correr_agente_claude_code(mensaje_usuario):
     global _historial
     tools_text = _formatear_herramientas_texto()
@@ -1246,6 +1371,13 @@ _ZHIPU_ACTION_SUFFIX = (
 
 def correr_agente_zhipu(mensaje_usuario):
     global _historial
+    if client is None:
+        print(
+            "Error: cliente zhipu no inicializado.\n"
+            "  Verifica que ZAI_API_KEY esté seteada y que zai-sdk esté instalado.\n"
+            "  Ejecuta: export ZAI_API_KEY=tu_clave  y  pip install zai-sdk"
+        )
+        return
     _historial.append({"role": "user", "content": mensaje_usuario})
     messages = [{"role": "system", "content": SYSTEM_PROMPT + _ZHIPU_ACTION_SUFFIX}]
     messages += [{"role": e["role"], "content": e["content"]} for e in _historial
@@ -1256,6 +1388,7 @@ def correr_agente_zhipu(mensaje_usuario):
     respuesta_final = ""
     tools_openai = _tools_a_openai()
     tool_log = []
+    _ya_compacto = False
 
     for _ in range(MAX_ITER):
         if _detener_agente.is_set():
@@ -1287,12 +1420,29 @@ def correr_agente_zhipu(mensaje_usuario):
 
         if not native_tool_calls:
             content = (msg.content or "").strip()
+            # Quitar bloques <think>...</think> del modelo GLM (chain-of-thought interno)
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
             if not content:
+                tokens_aprox = sum(len(str(m.get("content", "") or "")) for m in messages)
+                es_limite = finish_reason == "length" or tokens_aprox > 10_000
+                if es_limite and not _ya_compacto:
+                    _ya_compacto = True
+                    print(f"\n[Contexto demasiado largo ({tokens_aprox} chars) — compactando historial automáticamente...]")
+                    resultado_compact = compactar_historial()
+                    print(f"[{resultado_compact}]")
+                    # Volver a agregar el mensaje actual (compactar_historial lo eliminó)
+                    _historial.append({"role": "user", "content": mensaje_usuario})
+                    messages = [{"role": "system", "content": SYSTEM_PROMPT + _ZHIPU_ACTION_SUFFIX}]
+                    messages += [
+                        {"role": e["role"], "content": e["content"]}
+                        for e in _historial if e["role"] in ("user", "assistant")
+                    ]
+                    continue
                 motivo = f"finish_reason='{finish_reason}'" if finish_reason else "sin finish_reason"
                 print(
                     f"\n[Zhipu devolvió respuesta vacía — {motivo}]\n"
                     f"  Causa probable: filtro de contenido, límite de tokens, o contexto demasiado largo.\n"
-                    f"  Mensajes en contexto: {len(messages)} | Tokens aprox: {sum(len(str(m.get('content','')or'')) for m in messages)}\n"
+                    f"  Mensajes en contexto: {len(messages)} | Tokens aprox: {tokens_aprox}\n"
                     f"  Intenta reiniciar la conversación o reducir el historial."
                 )
                 break
@@ -1335,8 +1485,9 @@ def correr_agente_zhipu(mensaje_usuario):
                 break
             print(f"[Herramienta: {nombre}]")
             resultado = ejecutar_herramienta(nombre, inputs_tc)
-            print(f"[→ {resultado}]")
             resultado_str = str(resultado)
+            preview = resultado_str[:300] + ("…" if len(resultado_str) > 300 else "")
+            print(f"[→ {preview}]")
             tool_log.append(f"{nombre}({json.dumps(inputs_tc, ensure_ascii=False, default=str)}) → {resultado_str[:400]}")
             messages.append({
                 "role": "tool",
@@ -1348,6 +1499,8 @@ def correr_agente_zhipu(mensaje_usuario):
     if tool_log:
         resumen_tools = "Acciones realizadas este turno:\n" + "\n".join(f"  • {t}" for t in tool_log)
         _historial.append({"role": "assistant", "content": resumen_tools})
+        if not respuesta_final:
+            print("\nAcciones completadas:\n" + "\n".join(f"  • {t}" for t in tool_log))
     if respuesta_final:
         _historial.append({"role": "assistant", "content": respuesta_final})
 
@@ -1454,10 +1607,12 @@ if __name__ == "__main__":
     _solicitar_permiso[0] = _solicitar_permiso_desde_hilo
 
     def _mostrar_selector_ruta(callback):
+        from tkinter import filedialog
+
         dialogo = tk.Toplevel(ventana)
         dialogo.title("Carpeta del proyecto")
-        dialogo.geometry("460x220")
-        dialogo.resizable(False, False)
+        dialogo.geometry("540x240")
+        dialogo.resizable(True, False)
         dialogo.configure(bg="#1e1e2e")
         dialogo.grab_set()
         dialogo.lift()
@@ -1465,30 +1620,58 @@ if __name__ == "__main__":
         dialogo.focus_force()
 
         tk.Label(
-            dialogo,
-            text=f"Se creará dentro de:\n{AGENT_DIR}",
-            font=("Helvetica", 11), fg="#6b7280", bg="#1e1e2e", justify="left"
+            dialogo, text="Ruta del proyecto:",
+            font=("Helvetica", 12, "bold"), bg="#1e1e2e", fg="#e2e8f0"
         ).pack(pady=(18, 4), padx=20, anchor="w")
 
         tk.Label(
-            dialogo, text="Nombre de la carpeta del proyecto:",
-            font=("Helvetica", 12, "bold"), bg="#1e1e2e", fg="#e2e8f0"
+            dialogo,
+            text="Escribe un nombre (se crea en el directorio del agente) o usa Examinar.",
+            font=("Helvetica", 10), fg="#6b7280", bg="#1e1e2e", justify="left"
         ).pack(padx=20, anchor="w")
 
-        entrada_nombre = tk.Entry(
-            dialogo, font=("Helvetica", 12),
+        frame_entrada = tk.Frame(dialogo, bg="#1e1e2e")
+        frame_entrada.pack(fill=tk.X, padx=20, pady=(8, 0))
+
+        entrada_ruta = tk.Entry(
+            frame_entrada, font=("Helvetica", 11),
             bg="#252540", fg="#e2e8f0", insertbackground="#e2e8f0",
             relief="flat", highlightbackground="#3a3a5c",
             highlightcolor="#3b82f6", highlightthickness=1
         )
-        entrada_nombre.pack(fill=tk.X, padx=20, pady=(8, 0), ipady=6)
-        entrada_nombre.focus()
+        entrada_ruta.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
+        entrada_ruta.focus()
+
+        def examinar():
+            dialogo.attributes("-topmost", False)
+            ruta_sel = filedialog.askdirectory(
+                title="Seleccionar carpeta del proyecto",
+                initialdir=AGENT_DIR,
+                parent=dialogo,
+            )
+            dialogo.attributes("-topmost", True)
+            dialogo.lift()
+            if ruta_sel:
+                entrada_ruta.delete(0, tk.END)
+                entrada_ruta.insert(0, ruta_sel)
+
+        tk.Button(
+            frame_entrada, text="📂 Examinar",
+            command=examinar,
+            font=("Helvetica", 11), bg="#3b4261", fg="#e2e8f0",
+            activebackground="#4a5280", activeforeground="white",
+            relief="flat", padx=10, pady=5, cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         def confirmar():
-            nombre = entrada_nombre.get().strip()
-            if not nombre:
+            valor = entrada_ruta.get().strip()
+            if not valor:
                 return
-            ruta = os.path.join(AGENT_DIR, nombre)
+            # Ruta absoluta ingresada directamente o vía Examinar
+            if os.path.isabs(valor):
+                ruta = valor
+            else:
+                ruta = os.path.join(AGENT_DIR, valor)
             os.makedirs(ruta, exist_ok=True)
             msg_queue.put(("sistema", f"Ruta del proyecto: {ruta}\n\n"))
             dialogo.destroy()
@@ -1499,13 +1682,13 @@ if __name__ == "__main__":
             callback(None)
 
         dialogo.protocol("WM_DELETE_WINDOW", cancelar)
-        entrada_nombre.bind("<Return>", lambda _: confirmar())
+        entrada_ruta.bind("<Return>", lambda _: confirmar())
 
         frame_btns = tk.Frame(dialogo, bg="#1e1e2e")
         frame_btns.pack(pady=16)
 
         tk.Button(
-            frame_btns, text="✓  Crear", command=confirmar,
+            frame_btns, text="✓  Confirmar", command=confirmar,
             font=("Helvetica", 12, "bold"), bg="#16a34a", fg="white",
             activebackground="#15803d", activeforeground="white",
             relief="flat", padx=18, pady=6, cursor="hand2"
@@ -1679,10 +1862,17 @@ if __name__ == "__main__":
             agregar_texto(f"Sistema: {resultado}\n\n", "sistema")
             return
 
+        if mensaje in ("/compact", "/compactar"):
+            resultado = compactar_historial()
+            agregar_texto(f"Sistema: {resultado}\n\n", "sistema")
+            return
+
         _actualizar_btn(False)
         agregar_texto(f"Tú: {mensaje}\n", "usuario")
         iniciar_procesando()
         _detener_agente.clear()
+
+        _n_msgs = [0]
 
         def print_a_cola(*args):
             texto = " ".join(str(a) for a in args)
@@ -1690,12 +1880,17 @@ if __name__ == "__main__":
                 msg_queue.put(("modo", texto[8:]))
             else:
                 msg_queue.put(("agente", texto + "\n"))
+                _n_msgs[0] += 1
 
         def ejecutar():
+            _n_msgs[0] = 0
             builtins.print = print_a_cola
             try:
                 correr_agente(mensaje)
-                msg_queue.put(("agente", "\n"))
+                if _n_msgs[0] == 0:
+                    msg_queue.put(("sistema", "Agente finalizó sin respuesta visible. Sin cambios realizados.\n\n"))
+                else:
+                    msg_queue.put(("agente", "\n"))
             except Exception as ex:
                 msg_queue.put(("error", f"Error: {ex}\n"))
             finally:
