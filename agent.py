@@ -56,10 +56,19 @@ def guardar_conocimiento(modo, entries):
 def construir_system_prompt(modo):
     base = cargar_prompt(modo)
     entries = cargar_conocimiento(modo)
+
+    modos_lista = "\n".join(f'  - "{k}" → {v}' for k, v in MODOS_ETIQUETAS.items() if k != modo)
+    switching_rule = (
+        "\n\n## REGLA DE CAMBIO DE EXPERTO\n"
+        "Si el usuario pide algo FUERA de tu área de especialización, cambia de modo INMEDIATAMENTE usando:\n"
+        '<tool_call>{"name": "cambiar_modo", "inputs": {"modo": "nombre_modo"}}</tool_call>\n'
+        f"Expertos disponibles:\n{modos_lista}"
+    )
+
     if not entries:
-        return base
+        return base + switching_rule
     conocimiento_txt = "\n".join(f"- [{e['tema']}]: {e['contenido']}" for e in entries)
-    return f"{base}\n\n## CONOCIMIENTO ACUMULADO DE EXPERIENCIAS PREVIAS\n{conocimiento_txt}"
+    return f"{base}{switching_rule}\n\n## CONOCIMIENTO ACUMULADO DE EXPERIENCIAS PREVIAS\n{conocimiento_txt}"
 
 
 SYSTEM_PROMPT = construir_system_prompt(MODO_ACTUAL)
@@ -227,11 +236,22 @@ TOOLS = [
     {
         "name": "solicitar_ruta_proyecto",
         "description": (
-            "Muestra al usuario un selector de carpeta para elegir dónde crear el proyecto. "
-            "OBLIGATORIO: llama a esta herramienta ANTES de usar crear_archivo o crear_carpeta. "
-            "Nunca asumas ni inventes una ruta."
+            "Configura la carpeta raíz del proyecto. "
+            "Si el usuario mencionó una ruta en su mensaje, pásala en 'ruta_sugerida' — "
+            "si existe, se configura automáticamente sin mostrar diálogo. "
+            "Si no hay ruta sugerida, muestra un selector al usuario. "
+            "OBLIGATORIO: llama a esta herramienta ANTES de usar crear_archivo, crear_carpeta o leer_archivo."
         ),
-        "input_schema": {"type": "object", "properties": {}, "required": []}
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ruta_sugerida": {
+                    "type": "string",
+                    "description": "Ruta inferida del mensaje del usuario, ej: 'development/cotizacion_lab'. Relativa al directorio del agente o absoluta."
+                }
+            },
+            "required": []
+        }
     },
     {
         "name": "crear_carpeta",
@@ -618,6 +638,24 @@ def _despachar_herramienta(nombre, inputs):
         return "Confirmación no disponible. Procede."
 
     if nombre == "solicitar_ruta_proyecto":
+        ruta_sugerida = inputs.get("ruta_sugerida", "").strip()
+        if ruta_sugerida:
+            if os.path.isabs(ruta_sugerida):
+                ruta_resuelta = ruta_sugerida
+            else:
+                ruta_resuelta = os.path.join(AGENT_DIR, ruta_sugerida)
+            ruta_resuelta = os.path.abspath(ruta_resuelta)
+            if os.path.isdir(ruta_resuelta):
+                RUTA_PROYECTO[0] = ruta_resuelta
+                return (
+                    f"Ruta del proyecto configurada automáticamente: {ruta_resuelta}\n"
+                    f"IMPORTANTE: ruta_relativa es RELATIVA a esa carpeta raíz.\n"
+                    f"  - Para listar la raíz: ruta_relativa=\"\"\n"
+                    f"  - Para un archivo en la raíz: ruta_relativa=\"index.html\"\n"
+                    f"  - Para una subcarpeta: ruta_relativa=\"src/App.tsx\"\n"
+                    f"  NUNCA incluyas '{ruta_resuelta}' en ruta_relativa.\n"
+                    f"Procede AHORA con la tarea. NO hagas más preguntas."
+                )
         if _solicitar_ruta[0]:
             ruta = _solicitar_ruta[0]()
             if ruta:
@@ -1067,7 +1105,10 @@ def correr_agente_ollama(mensaje_usuario):
             inputs_tc = tc.get("inputs", {})
             print(f"[Herramienta: {nombre}]")
             resultado = ejecutar_herramienta(nombre, inputs_tc)
-            print(f"[→ {resultado}]")
+            if nombre == "leer_archivo":
+                print(f"[→ {inputs_tc.get('ruta_relativa', '?')}]")
+            else:
+                print(f"[→ {resultado}]")
             resultados.append(f"{nombre}: {resultado}")
 
         messages.append({
@@ -1334,7 +1375,10 @@ def correr_agente_claude_code(mensaje_usuario):
             inputs_tc = tc.get("inputs", {})
             print(f"\n[Herramienta: {nombre}]")
             resultado = ejecutar_herramienta(nombre, inputs_tc)
-            print(f"[→ {resultado}]")
+            if nombre == "leer_archivo":
+                print(f"[→ {inputs_tc.get('ruta_relativa', '?')}]")
+            else:
+                print(f"[→ {resultado}]")
             resultados.append(f"{nombre}: {resultado}")
 
         if resultados:
@@ -1486,9 +1530,13 @@ def correr_agente_zhipu(mensaje_usuario):
             print(f"[Herramienta: {nombre}]")
             resultado = ejecutar_herramienta(nombre, inputs_tc)
             resultado_str = str(resultado)
-            preview = resultado_str[:300] + ("…" if len(resultado_str) > 300 else "")
-            print(f"[→ {preview}]")
-            tool_log.append(f"{nombre}({json.dumps(inputs_tc, ensure_ascii=False, default=str)}) → {resultado_str[:400]}")
+            if nombre == "leer_archivo":
+                print(f"[→ {inputs_tc.get('ruta_relativa', '?')}]")
+                tool_log.append(f"{nombre}({inputs_tc.get('ruta_relativa', '?')}) → [{len(resultado_str)} chars leídos]")
+            else:
+                preview = resultado_str[:300] + ("…" if len(resultado_str) > 300 else "")
+                print(f"[→ {preview}]")
+                tool_log.append(f"{nombre}({json.dumps(inputs_tc, ensure_ascii=False, default=str)}) → {resultado_str[:400]}")
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
