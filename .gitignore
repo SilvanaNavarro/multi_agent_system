@@ -7,4 +7,7 @@ __pycache__/
 knowledge_*.json
 custom_modes.json
 custom_tools.json
+Bugs/
+agent_debug.log
+agent_prompt_cv_optimizer.txt
 

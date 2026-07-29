@@ -60,15 +60,28 @@ def construir_system_prompt(modo):
     modos_lista = "\n".join(f'  - "{k}" → {v}' for k, v in MODOS_ETIQUETAS.items() if k != modo)
     switching_rule = (
         "\n\n## REGLA DE CAMBIO DE EXPERTO\n"
-        "Si el usuario pide algo FUERA de tu área de especialización, cambia de modo INMEDIATAMENTE usando:\n"
+        "PRIORIDAD: Antes de cambiar de modo, verifica si alguna herramienta disponible puede resolver la solicitud.\n"
+        "- Cambia de modo SOLO si ninguna herramienta existente puede manejar la solicitud Y el tema es claramente de otro experto.\n"
+        "- Si existe una herramienta adecuada para la tarea, ÚSALA sin cambiar de modo.\n\n"
+        "Si debes cambiar de modo, usa:\n"
         '<tool_call>{"name": "cambiar_modo", "inputs": {"modo": "nombre_modo"}}</tool_call>\n'
         f"Expertos disponibles:\n{modos_lista}"
     )
 
+    approval_rule = (
+        "\n\n## REGLA DE APROBACIÓN OBLIGATORIA — MODIFICACIÓN DE ARCHIVOS\n"
+        "ANTES de llamar a editar_archivo o crear_archivo SIEMPRE debes:\n"
+        "1. Escribir un mensaje al usuario explicando QUÉ cambios planeas hacer y POR QUÉ.\n"
+        "2. Llamar a pedir_confirmacion con un resumen de TODOS los cambios planeados.\n"
+        "3. Solo si el usuario aprueba, ejecutar las herramientas de edición.\n"
+        "NUNCA edites ni crees archivos sin haber explicado el plan y recibido aprobación explícita.\n"
+        "Esta regla es ABSOLUTA — aplica sin excepción a todos los modos y backends."
+    )
+
     if not entries:
-        return base + switching_rule
+        return base + switching_rule + approval_rule
     conocimiento_txt = "\n".join(f"- [{e['tema']}]: {e['contenido']}" for e in entries)
-    return f"{base}{switching_rule}\n\n## CONOCIMIENTO ACUMULADO DE EXPERIENCIAS PREVIAS\n{conocimiento_txt}"
+    return f"{base}{switching_rule}{approval_rule}\n\n## CONOCIMIENTO ACUMULADO DE EXPERIENCIAS PREVIAS\n{conocimiento_txt}"
 
 
 SYSTEM_PROMPT = construir_system_prompt(MODO_ACTUAL)
@@ -157,6 +170,7 @@ TOOLS = [
         "name": "cambiar_modo",
         "description": (
             "Cambia el modo del agente activando al experto del área requerida. "
+            "IMPORTANTE: Usar SOLO cuando ninguna herramienta disponible puede resolver la solicitud. "
             f"Modos disponibles: {', '.join(MODOS.keys())}."
         ),
         "input_schema": {
@@ -421,6 +435,20 @@ TOOLS = [
             },
             "required": ["tema", "contenido"]
         }
+    },
+    {
+        "name": "diagnosticar_impresion",
+        "description": (
+            "Diagnostica automáticamente problemas de impresión y exportación PDF en el proyecto web. "
+            "ÚSALA SIEMPRE PRIMERO cuando el usuario reporte: colores incorrectos en PDF, "
+            "header blanco al imprimir, fondo que desaparece al guardar PDF, elementos invisibles en PDF. "
+            "Escanea JS y CSS del proyecto y retorna un reporte estructurado con todos los problemas encontrados."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
     }
 ]
 
@@ -467,7 +495,13 @@ def guardar_modo_custom(nombre_modo, etiqueta, archivo):
 
 
 def _registrar_tool(nombre, descripcion, input_schema, codigo):
-    namespace = {}
+    # _ruta_segura se define más abajo en el módulo; usar lambda para resolución diferida
+    # evita NameError cuando cargar_herramientas_custom() se llama antes de esa definición.
+    namespace = {
+        "RUTA_PROYECTO": RUTA_PROYECTO,
+        "_ruta_segura": lambda *a, **kw: _ruta_segura(*a, **kw),
+        "_solicitar_confirmacion": _solicitar_confirmacion,
+    }
     exec(codigo, namespace)  # noqa: S102
     if nombre not in namespace:
         raise ValueError(f"El código no define una función llamada '{nombre}'")
@@ -510,14 +544,28 @@ cargar_herramientas_custom()
 # IMPLEMENTACIÓN DE HERRAMIENTAS
 # ============================================================
 
+def _asegurar_ruta_proyecto():
+    """Abre el selector de ruta automáticamente si no hay ruta configurada.
+    Retorna None si la ruta ya está configurada o el usuario eligió una.
+    Retorna str de error si el usuario canceló o el selector no está disponible."""
+    if RUTA_PROYECTO[0]:
+        return None
+    if _solicitar_ruta[0]:
+        ruta = _solicitar_ruta[0]()
+        if ruta:
+            return None  # _solicitar_ruta[0] ya actualizó RUTA_PROYECTO[0] via callback
+        return "El usuario no seleccionó ninguna carpeta de proyecto. No se puede continuar."
+    return (
+        "Error: no hay ruta de proyecto configurada.\n"
+        "Llama solicitar_ruta_proyecto antes de usar herramientas de archivos."
+    )
+
+
 def _ruta_segura(ruta_relativa):
     """Devuelve (ruta_abs, error). error es None si la ruta es válida."""
-    if not RUTA_PROYECTO[0]:
-        return None, (
-            "Error: no hay ruta de proyecto configurada.\n"
-            "Causa: solicitar_ruta_proyecto no fue llamada o el usuario canceló.\n"
-            "Acción requerida: llama solicitar_ruta_proyecto antes de crear archivos."
-        )
+    err = _asegurar_ruta_proyecto()
+    if err:
+        return None, err
     base = os.path.abspath(RUTA_PROYECTO[0])
     ruta_rel = (ruta_relativa or "").strip().lstrip("/\\")
     if ruta_rel.startswith(base):
@@ -535,27 +583,55 @@ def _ruta_segura(ruta_relativa):
     return ruta_abs, None
 
 
+import logging as _logging
+import datetime as _datetime
+
+_LOG_PATH = os.path.join(AGENT_DIR, "agent_debug.log")
+_log_handler = _logging.FileHandler(_LOG_PATH, encoding="utf-8")
+_log_handler.setFormatter(_logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+_tool_logger = _logging.getLogger("agent.tools")
+_tool_logger.setLevel(_logging.DEBUG)
+_tool_logger.addHandler(_log_handler)
+_tool_logger.propagate = False
+
+
+def _log_tool(nombre, inputs, result):
+    inputs_str = json.dumps(inputs, ensure_ascii=False, default=str)
+    if len(inputs_str) > 300:
+        inputs_str = inputs_str[:300] + "…"
+    result_str = str(result) if result is not None else "<None>"
+    if len(result_str) > 400:
+        result_str = result_str[:400] + "…"
+    _tool_logger.debug("[TOOL] %s | inputs=%s | result=%s", nombre, inputs_str, result_str)
+
+
 def ejecutar_herramienta(nombre, inputs):
     global SYSTEM_PROMPT, MODO_ACTUAL
     try:
-        return _despachar_herramienta(nombre, inputs)
+        result = _despachar_herramienta(nombre, inputs)
+        _log_tool(nombre, inputs, result)
+        return result
     except KeyError as exc:
-        return (
+        msg = (
             f"[ERROR] Herramienta '{nombre}': falta parámetro requerido.\n"
             f"  Campo faltante: {exc}\n"
             f"  Parámetros recibidos: {list(inputs.keys())}\n"
             f"  Causa probable: el modelo omitió un campo obligatorio en el tool call.\n"
             f"  Acción: reintenta incluyendo todos los parámetros requeridos."
         )
+        _log_tool(nombre, inputs, msg)
+        return msg
     except Exception as exc:
         import traceback as _tb
-        return (
+        msg = (
             f"[ERROR INESPERADO] en herramienta '{nombre}'\n"
             f"  Inputs recibidos: {json.dumps(inputs, ensure_ascii=False, default=str)}\n"
             f"  Tipo: {type(exc).__name__}\n"
             f"  Detalle: {exc}\n"
             f"  Traza:\n{_tb.format_exc()}"
         )
+        _log_tool(nombre, inputs, msg)
+        return msg
 
 
 def _despachar_herramienta(nombre, inputs):
@@ -702,6 +778,18 @@ def _despachar_herramienta(nombre, inputs):
         ruta_abs, err = _ruta_segura(inputs["ruta_relativa"])
         if err:
             return err
+        if _solicitar_confirmacion[0]:
+            contenido_preview = inputs.get("contenido", "")[:300].replace("\n", "↵")
+            n_chars = len(inputs.get("contenido", ""))
+            pregunta = (
+                f"El agente quiere CREAR el archivo '{inputs['ruta_relativa']}' "
+                f"({n_chars} caracteres).\n\n"
+                f"Vista previa:\n{contenido_preview}"
+                f"{'…' if n_chars > 300 else ''}"
+            )
+            aprobado = _solicitar_confirmacion[0](pregunta)
+            if not aprobado:
+                return f"El usuario rechazó crear '{inputs['ruta_relativa']}'. No se realizó ningún cambio."
         try:
             os.makedirs(os.path.dirname(ruta_abs) or RUTA_PROYECTO[0], exist_ok=True)
             with open(ruta_abs, "w", encoding="utf-8") as f:
@@ -724,9 +812,61 @@ def _despachar_herramienta(nombre, inputs):
                 f"Error: '{inputs.get('ruta_relativa')}' no existe o no es un archivo.\n"
                 f"Usa listar_archivos con ruta_relativa='' para ver los archivos disponibles."
             )
+        # --- Auto-conversión de .docx a texto plano ---
+        if ruta_abs.lower().endswith(".docx"):
+            try:
+                import docx as _docx_mod
+                doc = _docx_mod.Document(ruta_abs)
+                partes = []
+                for p in doc.paragraphs:
+                    if p.text.strip():
+                        partes.append(p.text)
+                # Incluir tablas
+                for table in doc.tables:
+                    for row in table.rows:
+                        fila = " | ".join(c.text.strip() for c in row.cells if c.text.strip())
+                        if fila:
+                            partes.append(fila)
+                contenido = "\n".join(partes)
+                if not contenido.strip():
+                    return (
+                        f"[DOCX VACÍO] '{inputs.get('ruta_relativa')}' es un .docx sin texto extraíble."
+                    )
+                # Guardar .txt al lado del .docx
+                ruta_txt = ruta_abs[:-5] + ".txt"
+                with open(ruta_txt, "w", encoding="utf-8") as f:
+                    f.write(contenido)
+                ruta_rel = inputs.get("ruta_relativa", "")
+                ruta_txt_rel = ruta_rel[:-5] + ".txt" if ruta_rel.lower().endswith(".docx") else ruta_txt
+                return (
+                    f"[DOCX → TXT] Convertido automáticamente.\n"
+                    f"Texto guardado en: {ruta_txt_rel}\n"
+                    f"{'─'*50}\n"
+                    f"{contenido}"
+                )
+            except ImportError:
+                return (
+                    "Error: 'python-docx' no instalado.\n"
+                    "Ejecuta: pip3 install python-docx"
+                )
+            except Exception as e:
+                return f"Error al leer .docx '{ruta_abs}': {type(e).__name__}: {e}"
+        # --- Lectura normal de texto plano ---
         try:
             with open(ruta_abs, "r", encoding="utf-8") as f:
-                return f.read()
+                contenido = f.read()
+            if not contenido.strip():
+                return (
+                    f"[ARCHIVO VACÍO] '{inputs.get('ruta_relativa')}' existe pero tiene 0 bytes de contenido.\n"
+                    f"  Causa probable: el archivo fue creado pero nunca se escribió contenido en él.\n"
+                    f"  Acción: verifica cómo fue creado el archivo o pide al usuario que lo rellene."
+                )
+            return contenido
+        except UnicodeDecodeError:
+            return (
+                f"Error: '{inputs.get('ruta_relativa')}' no es un archivo de texto legible (binario o encoding no UTF-8).\n"
+                f"  Si es un .docx, asegúrate de que la extensión sea .docx."
+            )
         except OSError as e:
             return f"Error al leer '{ruta_abs}': {type(e).__name__}: {e}"
 
@@ -739,6 +879,19 @@ def _despachar_herramienta(nombre, inputs):
                 f"Error: '{inputs['ruta_relativa']}' no existe o no es un archivo.\n"
                 f"Usa listar_archivos con ruta_relativa='' para ver los archivos disponibles."
             )
+        if _solicitar_confirmacion[0]:
+            orig_preview = inputs["texto_original"][:200].replace("\n", "↵")
+            nuevo_preview = inputs["texto_nuevo"][:200].replace("\n", "↵")
+            pregunta = (
+                f"El agente quiere EDITAR '{inputs['ruta_relativa']}'.\n\n"
+                f"Reemplazar:\n{orig_preview}"
+                f"{'…' if len(inputs['texto_original']) > 200 else ''}\n\n"
+                f"Con:\n{nuevo_preview}"
+                f"{'…' if len(inputs['texto_nuevo']) > 200 else ''}"
+            )
+            aprobado = _solicitar_confirmacion[0](pregunta)
+            if not aprobado:
+                return f"El usuario rechazó editar '{inputs['ruta_relativa']}'. No se realizó ningún cambio."
         try:
             with open(ruta_abs, "r", encoding="utf-8") as f:
                 contenido = f.read()
@@ -746,13 +899,31 @@ def _despachar_herramienta(nombre, inputs):
             return f"Error al leer '{ruta_abs}': {type(e).__name__}: {e}"
         texto_original = inputs["texto_original"]
         if texto_original not in contenido:
-            preview = contenido[:300].replace("\n", "↵")
-            return (
-                f"Error: texto_original no encontrado en '{inputs['ruta_relativa']}'.\n"
-                f"  Buscado: {repr(texto_original[:120])}\n"
-                f"  Primeros 300 chars del archivo: {preview}\n"
-                f"  Usa leer_archivo para ver el contenido exacto antes de editar."
-            )
+            # Intentar match parcial con los primeros 60 chars para dar contexto útil
+            partial = texto_original[:60]
+            idx = contenido.find(partial)
+            if idx != -1:
+                start = max(0, idx - 100)
+                end = min(len(contenido), idx + 300)
+                contexto = contenido[start:end].replace("\n", "↵")
+                return (
+                    f"Error: texto_original no encontrado EXACTAMENTE en '{inputs['ruta_relativa']}'. "
+                    f"Los primeros 60 chars SÍ se encontraron en la línea ~{contenido[:idx].count(chr(10))+1}, "
+                    f"pero el texto completo no coincide (diferencia en espacios, tabs o saltos de línea).\n"
+                    f"  Buscado: {repr(texto_original[:120])}\n"
+                    f"  Contexto real alrededor del match parcial:\n  {contexto}\n"
+                    f"  → Llama leer_archivo('{inputs['ruta_relativa']}') para copiar el texto exacto."
+                )
+            else:
+                preview = contenido[:400].replace("\n", "↵")
+                return (
+                    f"Error: texto_original no encontrado en '{inputs['ruta_relativa']}'.\n"
+                    f"  Buscado: {repr(texto_original[:120])}\n"
+                    f"  El texto no existe en el archivo. "
+                    f"Es posible que ya fue modificado o el texto fue generado de memoria.\n"
+                    f"  Inicio del archivo: {preview}\n"
+                    f"  → Llama leer_archivo('{inputs['ruta_relativa']}') para ver el contenido exacto y copiar el texto a editar."
+                )
         nuevo_contenido = contenido.replace(texto_original, inputs["texto_nuevo"], 1)
         try:
             with open(ruta_abs, "w", encoding="utf-8") as f:
@@ -819,8 +990,9 @@ def _despachar_herramienta(nombre, inputs):
         return "\n".join(lines)
 
     if nombre == "listar_archivos":
-        if not RUTA_PROYECTO[0]:
-            return "Llama primero a `solicitar_ruta_proyecto`."
+        err = _asegurar_ruta_proyecto()
+        if err:
+            return err
         ruta_rel = inputs.get("ruta_relativa", "").strip().lstrip("/\\")
         # Si el modelo pasó la ruta absoluta del proyecto como relativa, ignorarla
         base = os.path.abspath(RUTA_PROYECTO[0])
@@ -848,8 +1020,9 @@ def _despachar_herramienta(nombre, inputs):
         )
 
     if nombre == "buscar_en_proyecto":
-        if not RUTA_PROYECTO[0]:
-            return "No hay ruta de proyecto configurada. Llama solicitar_ruta_proyecto primero."
+        err = _asegurar_ruta_proyecto()
+        if err:
+            return err
         termino = inputs.get("termino", "").strip()
         if not termino:
             return "Se requiere 'termino'."
@@ -909,8 +1082,154 @@ def _despachar_herramienta(nombre, inputs):
         SYSTEM_PROMPT = construir_system_prompt(MODO_ACTUAL)
         return f"Conocimiento '{tema}' guardado para el modo '{MODO_ACTUAL}'."
 
+    if nombre == "diagnosticar_impresion":
+        err = _asegurar_ruta_proyecto()
+        if err:
+            return err
+        base = os.path.abspath(RUTA_PROYECTO[0])
+        reporte = ["=== DIAGNÓSTICO DE IMPRESIÓN/PDF ===\n"]
+
+        # --- 1. Escanear archivos JS ---
+        reporte.append("## JavaScript — interferencia con impresión")
+        js_encontrado = False
+        for root_dir, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "node_modules"]
+            for fname in sorted(files):
+                if not fname.endswith(".js"):
+                    continue
+                fpath = os.path.join(root_dir, fname)
+                rel = os.path.relpath(fpath, base)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()
+                    tiene_guard = any(
+                        "matchMedia('print')" in l or 'matchMedia("print")' in l
+                        for l in lines
+                    )
+                    tiene_beforeprint = any("beforeprint" in l for l in lines)
+                    for i, line in enumerate(lines, 1):
+                        ls = line.strip()
+                        if "IntersectionObserver" in line:
+                            reporte.append(f"  ⚠️  [{rel}:{i}] IntersectionObserver detectado")
+                            if not tiene_guard:
+                                reporte.append(f"       → Falta guardia: if (!window.matchMedia('print').matches)")
+                            if not tiene_beforeprint:
+                                reporte.append(f"       → Falta listener beforeprint para resetear opacity/transform")
+                            js_encontrado = True
+                        if "style.opacity" in line and "'0'" in line:
+                            reporte.append(f"  ⚠️  [{rel}:{i}] opacity='0' sin guardia de impresión: {ls}")
+                            js_encontrado = True
+                        if "body.style.opacity" in line:
+                            reporte.append(f"  ⚠️  [{rel}:{i}] body.style.opacity: {ls}")
+                            if not tiene_beforeprint:
+                                reporte.append(f"       → Falta: window.addEventListener('beforeprint', () => {{ document.body.style.opacity='1'; }})")
+                            js_encontrado = True
+                        if "beforeprint" in line:
+                            reporte.append(f"  ✅  [{rel}:{i}] beforeprint listener presente")
+                        if "matchMedia('print')" in line or 'matchMedia("print")' in line:
+                            reporte.append(f"  ✅  [{rel}:{i}] Guardia de impresión presente")
+                except OSError:
+                    pass
+        if not js_encontrado:
+            reporte.append("  Sin patrones de interferencia JS detectados.")
+
+        # --- 2. Escanear archivos CSS ---
+        reporte.append("\n## CSS — reglas de impresión")
+        for root_dir, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "node_modules"]
+            for fname in sorted(files):
+                if not fname.endswith(".css"):
+                    continue
+                fpath = os.path.join(root_dir, fname)
+                rel = os.path.relpath(fpath, base)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()
+
+                    media_print_lines = []
+                    for i, line in enumerate(lines, 1):
+                        if "@media print" in line.lower():
+                            media_print_lines.append(i)
+
+                    if len(media_print_lines) > 1:
+                        reporte.append(f"  ⚠️  [{rel}] {len(media_print_lines)} bloques @media print"
+                                       f" (líneas {media_print_lines}) → consolidar en uno")
+                    elif len(media_print_lines) == 1:
+                        reporte.append(f"  ✅  [{rel}] 1 bloque @media print (línea {media_print_lines[0]})")
+                    else:
+                        reporte.append(f"  ℹ️  [{rel}] Sin @media print")
+
+                    for i, line in enumerate(lines, 1):
+                        ls = line.strip()
+                        if "preserve" in line and "print-color-adjust" in line.lower():
+                            reporte.append(f"  ⚠️  [{rel}:{i}] PRESERVE: {ls}")
+                            reporte.append(f"       → Cambiar a: print-color-adjust: exact !important")
+                        if ("background: none" in line.lower() or "background:none" in line.lower()):
+                            ctx_start = max(0, i - 12)
+                            ctx = "".join(lines[ctx_start:i - 1])
+                            # Check if the selector group before this line includes a root element
+                            # (selector without child combinator as root)
+                            selector_lines = []
+                            for j in range(i - 2, ctx_start - 1, -1):
+                                sl = lines[j].strip() if j < len(lines) else ""
+                                if sl.endswith("{"):
+                                    break
+                                if sl.endswith(",") or (not sl.startswith(".") is False):
+                                    selector_lines.append(sl)
+                            has_root_selector = any(
+                                l.strip().endswith(",") and " " not in l.strip().rstrip(",")
+                                for l in lines[ctx_start:i - 1]
+                                if l.strip().endswith(",")
+                            )
+                            reporte.append(f"  ⚠️  [{rel}:{i}] background:none — verificar si el selector incluye el contenedor raíz")
+                            reporte.append(f"       → Si '.elemento,' aparece en el grupo, ese elemento perderá su fondo")
+                            reporte.append(f"       → Contexto: líneas {ctx_start + 1}–{i}")
+                except OSError:
+                    pass
+
+        reporte.append("\n## Causa más probable")
+        reporte.append("1. print-color-adjust: preserve → cambiar a exact")
+        reporte.append("2. IntersectionObserver sin guardia → envolver con matchMedia check + beforeprint")
+        reporte.append("3. background:none en selector que incluye contenedor → separar selectores")
+        reporte.append("4. Múltiples @media print → consolidar en uno")
+        reporte.append("\nRevisa cada ⚠️ arriba y corrige en ese orden.")
+        return "\n".join(reporte)
+
     if nombre in HERRAMIENTAS_DINAMICAS:
         try:
+            # Resolver parámetros "ruta*" relativos contra RUTA_PROYECTO[0]
+            if RUTA_PROYECTO[0]:
+                base = os.path.abspath(RUTA_PROYECTO[0])
+                inputs_resueltos = {}
+                for k, v in inputs.items():
+                    if k.startswith("ruta") and isinstance(v, str) and v and not os.path.isabs(v):
+                        ruta_resuelta = os.path.abspath(os.path.join(base, v))
+                        # Bloquear rutas que escapan del árbol del proyecto
+                        if ruta_resuelta.startswith(base):
+                            inputs_resueltos[k] = ruta_resuelta
+                        else:
+                            return (
+                                f"Error: ruta '{v}' escapa del árbol del proyecto.\n"
+                                f"  Raíz: {base}\n"
+                                f"  Resuelto: {ruta_resuelta}"
+                            )
+                    else:
+                        inputs_resueltos[k] = v
+                inputs = inputs_resueltos
+
+            tool_def = next((t for t in TOOLS if t["name"] == nombre), {})
+            desc = tool_def.get("description", "").lower()
+            palabras_escritura = ["crear", "guardar", "escribir", "create", "write", "save", "editar", "edit", "generar", "generate"]
+            es_escritura = any(p in desc for p in palabras_escritura)
+            if es_escritura and _solicitar_confirmacion[0]:
+                args_preview = json.dumps(inputs, ensure_ascii=False, default=str)
+                if len(args_preview) > 400:
+                    args_preview = args_preview[:400] + "…"
+                aprobado = _solicitar_confirmacion[0](
+                    f"La herramienta '{nombre}' quiere ejecutarse con:\n{args_preview}\n\n¿Aprobar?"
+                )
+                if not aprobado:
+                    return f"El usuario rechazó la ejecución de '{nombre}'. No se realizó ningún cambio."
             return str(HERRAMIENTAS_DINAMICAS[nombre](**inputs))
         except TypeError as e:
             return (
@@ -1409,7 +1728,15 @@ _ZHIPU_ACTION_SUFFIX = (
     "NUNCA describas lo que vas a hacer sin hacerlo — "
     "si necesitas editar un archivo, llama editar_archivo AHORA. "
     "Si necesitas leer un archivo, llama leer_archivo AHORA. "
-    "Decir 'voy a hacer X' sin llamar la herramienta es un error."
+    "Decir 'voy a hacer X' sin llamar la herramienta es un error.\n"
+    "Si necesitas la ruta del proyecto, llama solicitar_ruta_proyecto AHORA — "
+    "NUNCA le preguntes la ruta al usuario por texto. "
+    "El selector de carpeta se abrirá automáticamente.\n"
+    "REGLA DE EDICIÓN: SIEMPRE llama leer_archivo ANTES de editar_archivo. "
+    "Nunca escribas texto_original de memoria — copia el texto exacto del archivo leído.\n"
+    "REGLA PDF/IMPRESIÓN: Si el usuario menciona PDF, impresión, colores en PDF, "
+    "header blanco, fondo que desaparece: llama diagnosticar_impresion() PRIMERO. "
+    "NUNCA busques en script.js el botón de descarga — el bug está en CSS @media print, no en JS de restauración."
 )
 
 
@@ -1624,17 +1951,25 @@ if __name__ == "__main__":
 
         dialogo.protocol("WM_DELETE_WINDOW", rechazar)
 
-        tk.Button(
-            frame_btns, text="✓  Aceptar", command=aceptar,
+        btn_aceptar = tk.Label(
+            frame_btns, text="✓  Aceptar",
             font=("Helvetica", 12, "bold"), bg="#16a34a", fg="white",
-            activebackground="#15803d", activeforeground="white", padx=20, pady=6
-        ).pack(side=tk.LEFT, padx=10)
+            padx=20, pady=6, cursor="hand2"
+        )
+        btn_aceptar.bind("<Button-1>", lambda e: aceptar())
+        btn_aceptar.bind("<Enter>", lambda e: btn_aceptar.config(bg="#15803d"))
+        btn_aceptar.bind("<Leave>", lambda e: btn_aceptar.config(bg="#16a34a"))
+        btn_aceptar.pack(side=tk.LEFT, padx=10)
 
-        tk.Button(
-            frame_btns, text="✗  Rechazar", command=rechazar,
+        btn_rechazar = tk.Label(
+            frame_btns, text="✗  Rechazar",
             font=("Helvetica", 12, "bold"), bg="#dc2626", fg="white",
-            activebackground="#b91c1c", activeforeground="white", padx=20, pady=6
-        ).pack(side=tk.LEFT, padx=10)
+            padx=20, pady=6, cursor="hand2"
+        )
+        btn_rechazar.bind("<Button-1>", lambda e: rechazar())
+        btn_rechazar.bind("<Enter>", lambda e: btn_rechazar.config(bg="#b91c1c"))
+        btn_rechazar.bind("<Leave>", lambda e: btn_rechazar.config(bg="#dc2626"))
+        btn_rechazar.pack(side=tk.LEFT, padx=10)
 
         dialogo.update_idletasks()
         dialogo.grab_set()
@@ -1703,13 +2038,15 @@ if __name__ == "__main__":
                 entrada_ruta.delete(0, tk.END)
                 entrada_ruta.insert(0, ruta_sel)
 
-        tk.Button(
+        btn_examinar = tk.Label(
             frame_entrada, text="📂 Examinar",
-            command=examinar,
-            font=("Helvetica", 11), bg="#3b4261", fg="#e2e8f0",
-            activebackground="#4a5280", activeforeground="white",
-            relief="flat", padx=10, pady=5, cursor="hand2"
-        ).pack(side=tk.LEFT, padx=(8, 0))
+            font=("Helvetica", 11, "bold"), bg="#4f46e5", fg="white",
+            padx=10, pady=5, cursor="hand2"
+        )
+        btn_examinar.bind("<Button-1>", lambda e: examinar())
+        btn_examinar.bind("<Enter>", lambda e: btn_examinar.config(bg="#4338ca"))
+        btn_examinar.bind("<Leave>", lambda e: btn_examinar.config(bg="#4f46e5"))
+        btn_examinar.pack(side=tk.LEFT, padx=(8, 0))
 
         def confirmar():
             valor = entrada_ruta.get().strip()
@@ -1735,19 +2072,25 @@ if __name__ == "__main__":
         frame_btns = tk.Frame(dialogo, bg="#1e1e2e")
         frame_btns.pack(pady=16)
 
-        tk.Button(
-            frame_btns, text="✓  Confirmar", command=confirmar,
-            font=("Helvetica", 12, "bold"), bg="#16a34a", fg="white",
-            activebackground="#15803d", activeforeground="white",
-            relief="flat", padx=18, pady=6, cursor="hand2"
-        ).pack(side=tk.LEFT, padx=10)
+        btn_confirmar = tk.Label(
+            frame_btns, text="✓  Confirmar",
+            font=("Helvetica", 12, "bold"), bg="#15803d", fg="white",
+            padx=18, pady=6, cursor="hand2"
+        )
+        btn_confirmar.bind("<Button-1>", lambda e: confirmar())
+        btn_confirmar.bind("<Enter>", lambda e: btn_confirmar.config(bg="#166534"))
+        btn_confirmar.bind("<Leave>", lambda e: btn_confirmar.config(bg="#15803d"))
+        btn_confirmar.pack(side=tk.LEFT, padx=10)
 
-        tk.Button(
-            frame_btns, text="✗  Cancelar", command=cancelar,
-            font=("Helvetica", 12, "bold"), bg="#dc2626", fg="white",
-            activebackground="#b91c1c", activeforeground="white",
-            relief="flat", padx=18, pady=6, cursor="hand2"
-        ).pack(side=tk.LEFT, padx=10)
+        btn_cancelar = tk.Label(
+            frame_btns, text="✗  Cancelar",
+            font=("Helvetica", 12, "bold"), bg="#b91c1c", fg="white",
+            padx=18, pady=6, cursor="hand2"
+        )
+        btn_cancelar.bind("<Button-1>", lambda e: cancelar())
+        btn_cancelar.bind("<Enter>", lambda e: btn_cancelar.config(bg="#991b1b"))
+        btn_cancelar.bind("<Leave>", lambda e: btn_cancelar.config(bg="#b91c1c"))
+        btn_cancelar.pack(side=tk.LEFT, padx=10)
 
     def _solicitar_ruta_desde_hilo():
         evento = threading.Event()
@@ -1794,17 +2137,25 @@ if __name__ == "__main__":
 
         dialogo.protocol("WM_DELETE_WINDOW", rechazar)
 
-        tk.Button(
-            frame_btns, text="✓  Sí, procede", command=aceptar,
+        btn_si = tk.Label(
+            frame_btns, text="✓  Sí, procede",
             font=("Helvetica", 12, "bold"), bg="#16a34a", fg="white",
-            activebackground="#15803d", activeforeground="white", padx=16, pady=6
-        ).pack(side=tk.LEFT, padx=10)
+            padx=16, pady=6, cursor="hand2"
+        )
+        btn_si.bind("<Button-1>", lambda e: aceptar())
+        btn_si.bind("<Enter>", lambda e: btn_si.config(bg="#15803d"))
+        btn_si.bind("<Leave>", lambda e: btn_si.config(bg="#16a34a"))
+        btn_si.pack(side=tk.LEFT, padx=10)
 
-        tk.Button(
-            frame_btns, text="✗  No, cancela", command=rechazar,
+        btn_no = tk.Label(
+            frame_btns, text="✗  No, cancela",
             font=("Helvetica", 12, "bold"), bg="#dc2626", fg="white",
-            activebackground="#b91c1c", activeforeground="white", padx=16, pady=6
-        ).pack(side=tk.LEFT, padx=10)
+            padx=16, pady=6, cursor="hand2"
+        )
+        btn_no.bind("<Button-1>", lambda e: rechazar())
+        btn_no.bind("<Enter>", lambda e: btn_no.config(bg="#b91c1c"))
+        btn_no.bind("<Leave>", lambda e: btn_no.config(bg="#dc2626"))
+        btn_no.pack(side=tk.LEFT, padx=10)
 
         dialogo.update_idletasks()
         dialogo.grab_set()
@@ -2251,6 +2602,14 @@ if __name__ == "__main__":
     )
     entrada_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12), pady=8)
 
+    lbl_hint = tk.Label(
+        entrada_frame,
+        text="Shift+Enter: nueva línea",
+        font=("Helvetica", 8), bg=FONDO2, fg="#6b7280",
+        anchor="e", padx=6
+    )
+    lbl_hint.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 2))
+
     entrada_scroll = tk.Scrollbar(entrada_frame, orient=tk.VERTICAL)
     entrada_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -2269,6 +2628,11 @@ if __name__ == "__main__":
         enviar()
         return "break"
 
+    def _on_shift_return(event):
+        entrada.insert(tk.INSERT, "\n")
+        return "break"
+
+    entrada.bind("<Shift-Return>", _on_shift_return)
     entrada.bind("<Return>", _on_return)
     entrada.focus()
 

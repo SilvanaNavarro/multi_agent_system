@@ -44,6 +44,51 @@ pip install anthropic
 pip install ollama
 ```
 
+### 3. Configurar API key
+
+Crea un archivo `.env` en la raíz del proyecto:
+
+```bash
+# Para Zhipu (backend recomendado)
+ZAI_API_KEY=tu_clave_aqui
+
+# Para Anthropic (opcional)
+ANTHROPIC_API_KEY=tu_clave_aqui
+```
+
+El sistema carga `.env` automáticamente al iniciar.
+
+---
+
+## Obtener API keys
+
+### Zhipu / Z.AI (gratuito con registro)
+
+1. Entra a [z.ai](https://z.ai) → **Sign Up**
+2. Verifica tu correo
+3. En el dashboard ve a **API Keys** → **Create API Key**
+4. Copia la clave y pégala en `.env`:
+   ```
+   ZAI_API_KEY=tu_clave
+   ```
+5. Plan gratuito incluye cuota suficiente para desarrollo
+
+### Anthropic
+
+1. Entra a [console.anthropic.com](https://console.anthropic.com) → **Sign Up**
+2. Ve a **Settings → API Keys** → **Create Key**
+3. Agrega créditos en **Billing** (mínimo $5 USD para comenzar)
+4. Copia la clave y pégala en `.env`:
+   ```
+   ANTHROPIC_API_KEY=sk-ant-...
+   ```
+
+### Ollama y Claude Code
+
+No requieren API key.
+- **Ollama**: instala con `brew install ollama` y descarga modelos con `ollama pull`
+- **Claude Code**: instala el CLI e inicia sesión con tu cuenta de claude.ai
+
 ---
 
 ## Backends disponibles
@@ -131,6 +176,110 @@ python3 agent.py
 ```
 
 Se abre una ventana de chat.
+
+---
+
+## Cómo usar el sistema
+
+### Flujo básico
+
+El sistema arranca en modo **Project Manager**. Habla en lenguaje natural — el PM decide si responde él o activa a un experto.
+
+```
+Tú:     "Crea un script Python que lea un CSV y genere un reporte HTML"
+PM:     activa al Desarrollador Fullstack automáticamente
+Full:   crea los archivos en tu proyecto
+```
+
+No necesitas decir "cambia al experto X". El sistema lo detecta solo.
+
+### Comandos de sistema
+
+```
+/modo fullstack       → activa experto directamente sin pasar por el PM
+/modo devops
+/modo ciberseguridad
+/modo data_engineer
+/modo default         → vuelve al Project Manager
+/compact              → compacta el historial cuando la conversación es larga
+```
+
+### Elegir carpeta de proyecto
+
+Antes de crear archivos, el agente pide una carpeta destino mediante un diálogo gráfico. También puedes mencionarla en el mensaje:
+
+```
+"Crea la app en la carpeta development/mi_proyecto"
+```
+
+El agente la configura automáticamente si la ruta existe.
+
+### Ejemplos de uso por área
+
+**Desarrollo (Fullstack)**
+```
+"Crea una landing page con HTML, CSS y JS para una cafetería"
+"Agrega un formulario de contacto con validación al index.html"
+"Refactoriza el componente de login para usar async/await"
+```
+
+**Datos (Data Engineer)**
+```
+"Escribe una query SQL que agrupe ventas por mes y región"
+"Crea un pipeline de ETL en Python para procesar logs de servidor"
+"¿Qué índices debería agregar a esta tabla?"
+```
+
+**DevOps**
+```
+"Crea un Dockerfile para esta app Flask con Gunicorn"
+"Genera un GitHub Actions workflow para CI/CD"
+"Revisa este docker-compose y sugiere mejoras de seguridad"
+```
+
+**Seguridad**
+```
+"Audita este código Python en busca de vulnerabilidades"
+"¿Cómo protejo esta API contra ataques de inyección SQL?"
+"Genera un reporte de riesgos para esta arquitectura"
+```
+
+**Crear nuevos expertos**
+```
+"Necesito un experto en machine learning"
+"Crea un agente especializado en diseño UX/UI"
+"Quiero un experto en contratos legales"
+```
+
+El Creador de Agentes (KIKE) diseña el prompt, muestra un preview y pide confirmación antes de guardar.
+
+### Conocimiento persistente
+
+El agente puede recordar información entre sesiones:
+
+```
+"Recuerda que usamos PostgreSQL 15 con Django 4.2"
+"Guarda que el equipo prefiere TypeScript sobre JavaScript"
+"¿Qué sabes sobre la configuración de nuestra base de datos?"
+```
+
+El conocimiento se guarda por modo en `knowledge_<modo>.json` y se inyecta automáticamente en cada conversación.
+
+### Crear herramientas en tiempo real
+
+```
+"Necesito una herramienta que consulte el precio del dólar en tiempo real"
+"Crea una herramienta para convertir imágenes a base64"
+```
+
+El agente escribe el código Python, lo registra y lo usa de inmediato. Persiste en `custom_tools.json`.
+
+### Tips
+
+- **Sé específico con rutas**: "en la carpeta `src/components`" funciona mejor que "en algún lado"
+- **Pide confirmación explícita** antes de operaciones destructivas: "antes de borrar, muéstrame qué vas a eliminar"
+- **Usa `/compact`** si la conversación es muy larga y el modelo empieza a perder contexto
+- **Cambia de backend** en el dropdown superior sin reiniciar la app
 
 ---
 
