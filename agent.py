@@ -58,15 +58,58 @@ def construir_system_prompt(modo):
     entries = cargar_conocimiento(modo)
 
     modos_lista = "\n".join(f'  - "{k}" → {v}' for k, v in MODOS_ETIQUETAS.items() if k != modo)
+
+    # Leer triggers de modos custom (línea que empieza con "TRIGGER:" en su prompt)
+    _MODOS_BUILTIN = {"default", "ciberseguridad", "fullstack", "data_engineer", "devops", "agente_creator"}
+    _custom_trigger_lines = []
+    for _modo_nombre, _archivo_prompt in MODOS.items():
+        if _modo_nombre in _MODOS_BUILTIN or _modo_nombre == modo:
+            continue
+        try:
+            with open(_archivo_prompt, "r", encoding="utf-8") as _f:
+                for _linea in _f:
+                    _linea = _linea.strip()
+                    if _linea.startswith("TRIGGER:"):
+                        _keywords = _linea[len("TRIGGER:"):].strip()
+                        _etiqueta = MODOS_ETIQUETAS.get(_modo_nombre, _modo_nombre)
+                        _custom_trigger_lines.append(
+                            f"- {_keywords} → '{_modo_nombre}' ({_etiqueta})"
+                        )
+                    break  # solo primera línea
+        except OSError:
+            pass
+    _custom_triggers_str = ("\n" + "\n".join(_custom_trigger_lines)) if _custom_trigger_lines else ""
+
     switching_rule = (
         "\n\n## REGLA DE CAMBIO DE EXPERTO\n"
-        "PRIORIDAD: Antes de cambiar de modo, verifica si alguna herramienta disponible puede resolver la solicitud.\n"
-        "- Cambia de modo SOLO si ninguna herramienta existente puede manejar la solicitud Y el tema es claramente de otro experto.\n"
-        "- Si existe una herramienta adecuada para la tarea, ÚSALA sin cambiar de modo.\n\n"
-        "Si debes cambiar de modo, usa:\n"
+        "Cambia de modo según el DOMINIO de la solicitud, NO según si las herramientas disponibles pueden ejecutarla.\n"
+        "Las herramientas (editar_archivo, leer_archivo, etc.) existen en TODOS los modos — su presencia NO evita el cambio.\n"
+        "El cambio de modo activa el experto correcto para dar respuestas de mayor calidad.\n\n"
+        "CUÁNDO cambiar (usa el modo indicado sin excepciones):\n"
+        "- HTML / CSS / JS / React / diseño web / impresión / PDF / frontend → 'fullstack'\n"
+        "- Seguridad / vulnerabilidades / auth / pentesting → 'ciberseguridad'\n"
+        "- Pipelines de datos / ETL / SQL analytics / BigQuery → 'data_engineer'\n"
+        "- Docker / CI-CD / infraestructura / deploy / cloud → 'devops'\n"
+        "- Diseñar un nuevo rol de agente → 'agente_creator'\n"
+        f"{_custom_triggers_str}\n\n"
+        "Para cambiar usa:\n"
         '<tool_call>{"name": "cambiar_modo", "inputs": {"modo": "nombre_modo"}}</tool_call>\n'
         f"Expertos disponibles:\n{modos_lista}"
+        "\n\n## MANEJO DE MÚLTIPLES DIRECTORIOS\n"
+        "Si el usuario menciona archivos en DOS carpetas distintas (ej: 'cargo en carpeta A, CV en carpeta B'):\n"
+        "1. Llama solicitar_ruta_proyecto con el ANCESTRO COMÚN de ambas rutas.\n"
+        "   Ejemplo: si necesitas 'cv_manager/tenpo/cargo.txt' y 'cv_manager/n_8_n/cv.txt',\n"
+        "   usa ruta_sugerida='development/cv_manager'.\n"
+        "2. Luego accede a ambas con rutas relativas: 'tenpo/cargo.txt' y 'n_8_n/cv.txt'.\n"
+        "NUNCA configures RUTA_PROYECTO a una subcarpeta si necesitas archivos en su carpeta hermana."
     )
+
+    return_rule = (
+        "\n\n## REGLA DE RETORNO AL PROJECT MANAGER\n"
+        "Cuando hayas completado tu tarea principal, SIEMPRE llama:\n"
+        '<tool_call>{"name": "cambiar_modo", "inputs": {"modo": "default"}}</tool_call>\n'
+        "Esto devuelve el control al Project Manager para coordinar la siguiente solicitud."
+    ) if modo != "default" else ""
 
     approval_rule = (
         "\n\n## REGLA DE APROBACIÓN OBLIGATORIA — MODIFICACIÓN DE ARCHIVOS\n"
@@ -79,9 +122,9 @@ def construir_system_prompt(modo):
     )
 
     if not entries:
-        return base + switching_rule + approval_rule
+        return base + switching_rule + approval_rule + return_rule
     conocimiento_txt = "\n".join(f"- [{e['tema']}]: {e['contenido']}" for e in entries)
-    return f"{base}{switching_rule}{approval_rule}\n\n## CONOCIMIENTO ACUMULADO DE EXPERIENCIAS PREVIAS\n{conocimiento_txt}"
+    return f"{base}{switching_rule}{approval_rule}{return_rule}\n\n## CONOCIMIENTO ACUMULADO DE EXPERIENCIAS PREVIAS\n{conocimiento_txt}"
 
 
 SYSTEM_PROMPT = construir_system_prompt(MODO_ACTUAL)
@@ -804,9 +847,15 @@ def _despachar_herramienta(nombre, inputs):
         return f"Archivo creado: {ruta_abs}"
 
     if nombre == "leer_archivo":
-        ruta_abs, err = _ruta_segura(inputs.get("ruta_relativa", ""))
+        # Permite .. para leer archivos fuera de RUTA_PROYECTO (igual que listar_archivos)
+        err = _asegurar_ruta_proyecto()
         if err:
             return err
+        _base_lr = os.path.abspath(RUTA_PROYECTO[0])
+        _ruta_rel_lr = (inputs.get("ruta_relativa", "") or "").strip().lstrip("/\\")
+        if _ruta_rel_lr.startswith(_base_lr):
+            _ruta_rel_lr = _ruta_rel_lr[len(_base_lr):].lstrip("/\\")
+        ruta_abs = os.path.abspath(os.path.join(_base_lr, _ruta_rel_lr)) if _ruta_rel_lr else _base_lr
         if not os.path.isfile(ruta_abs):
             return (
                 f"Error: '{inputs.get('ruta_relativa')}' no existe o no es un archivo.\n"
@@ -898,6 +947,13 @@ def _despachar_herramienta(nombre, inputs):
         except OSError as e:
             return f"Error al leer '{ruta_abs}': {type(e).__name__}: {e}"
         texto_original = inputs["texto_original"]
+        texto_nuevo = inputs["texto_nuevo"]
+        if texto_original == texto_nuevo:
+            return (
+                f"Error: texto_original y texto_nuevo son idénticos en '{inputs['ruta_relativa']}' — "
+                f"no hay nada que editar. "
+                f"Llama leer_archivo('{inputs['ruta_relativa']}') para copiar el texto exacto a reemplazar."
+            )
         if texto_original not in contenido:
             # Intentar match parcial con los primeros 60 chars para dar contexto útil
             partial = texto_original[:60]
@@ -924,7 +980,13 @@ def _despachar_herramienta(nombre, inputs):
                     f"  Inicio del archivo: {preview}\n"
                     f"  → Llama leer_archivo('{inputs['ruta_relativa']}') para ver el contenido exacto y copiar el texto a editar."
                 )
-        nuevo_contenido = contenido.replace(texto_original, inputs["texto_nuevo"], 1)
+        nuevo_contenido = contenido.replace(texto_original, texto_nuevo, 1)
+        if nuevo_contenido == contenido:
+            return (
+                f"Error: el reemplazo no produjo cambios en '{inputs['ruta_relativa']}'. "
+                f"texto_original fue encontrado pero texto_nuevo es funcionalmente idéntico. "
+                f"No se escribió el archivo."
+            )
         try:
             with open(ruta_abs, "w", encoding="utf-8") as f:
                 f.write(nuevo_contenido)
@@ -1836,6 +1898,7 @@ def correr_agente_zhipu(mensaje_usuario):
             for tc in native_tool_calls
         ]})
 
+        _modo_antes = MODO_ACTUAL
         for tc in native_tool_calls:
             nombre_raw = tc.function.name or ""
             # GLM a veces mete args y tags XML en el name field — extraer solo el identificador
@@ -1870,12 +1933,117 @@ def correr_agente_zhipu(mensaje_usuario):
                 "content": resultado_str,
             })
 
-    # Guardar resumen de tools al historial para que el modelo recuerde contexto en el próximo turno
+        # Si cambiar_modo fue llamado, actualizar el system prompt en el contexto activo
+        if MODO_ACTUAL != _modo_antes:
+            messages[0] = {"role": "system", "content": SYSTEM_PROMPT + _ZHIPU_ACTION_SUFFIX}
+
+    # Si el modelo usó herramientas pero no dio respuesta final, verificar completitud.
+    # Si falta trabajo, pedir confirmación al usuario para continuar (otro batch de MAX_ITER).
+    MAX_CONTINUACIONES = 3
+    _continuaciones = 0
+    while tool_log and not respuesta_final and not _detener_agente.is_set():
+        if _continuaciones >= MAX_CONTINUACIONES:
+            respuesta_final = (
+                f"Tarea finalizada automáticamente tras {MAX_CONTINUACIONES} ciclos de continuación. "
+                "Si falta trabajo, describe la siguiente acción al agente."
+            )
+            print("\nAgente:", respuesta_final)
+            break
+        _continuaciones += 1
+
+        messages.append({
+            "role": "user",
+            "content": (
+                "¿Completaste COMPLETAMENTE la solicitud original del usuario? "
+                "Responde SOLO con una de estas dos formas:\n"
+                "- 'COMPLETO: [resumen breve de lo que se hizo]'\n"
+                "- 'PENDIENTE: [descripción específica de lo que falta por hacer]'"
+            ),
+        })
+        try:
+            _rc_check = client.chat.completions.create(model=MODELO, messages=messages)
+            _check = (_rc_check.choices[0].message.content or "").strip()
+            _check = re.sub(r"<think>.*?</think>", "", _check, flags=re.DOTALL).strip()
+        except Exception as e:
+            print(f"Error verificando completitud: {e}")
+            break
+
+        messages.append({"role": "assistant", "content": _check})
+
+        if "PENDIENTE" not in _check.upper():
+            # Tarea completa — mostrar resumen al usuario
+            respuesta_final = _check
+            print("\nAgente:", respuesta_final)
+            break
+
+        # Hay trabajo pendiente — pedir confirmación al usuario antes de continuar
+        descripcion_falta = _check[_check.find(":") + 1:].strip() if ":" in _check else _check
+        if _solicitar_confirmacion[0]:
+            continuar = _solicitar_confirmacion[0](
+                f"El agente no terminó la tarea (ciclo {_continuaciones}/{MAX_CONTINUACIONES}).\n\nFalta:\n{descripcion_falta}\n\n¿Quieres que continúe trabajando?"
+            )
+        else:
+            continuar = False
+
+        if not continuar:
+            _detener_agente.set()
+            respuesta_final = f"Tarea cancelada por el usuario.\n\nPendiente:\n{descripcion_falta}"
+            print("\nAgente:", respuesta_final)
+            break
+
+        # Usuario confirmó continuar — otro ciclo de MAX_ITER herramientas
+        messages.append({
+            "role": "user",
+            "content": "Continúa. Usa las herramientas necesarias para completar la tarea. No te detengas hasta terminar.",
+        })
+        for _ in range(MAX_ITER):
+            if _detener_agente.is_set():
+                break
+            try:
+                _rc2 = client.chat.completions.create(
+                    model=MODELO, messages=messages, tools=tools_openai, tool_choice="auto",
+                )
+            except Exception as e:
+                print(f"Error continuación: {e}")
+                break
+            _mc2 = _rc2.choices[0].message
+            _tc2 = getattr(_mc2, "tool_calls", None) or []
+            if not _tc2:
+                _text2 = re.sub(r"<think>.*?</think>", "", (_mc2.content or ""), flags=re.DOTALL).strip()
+                if _text2:
+                    respuesta_final = _text2
+                    print("\nAgente:", respuesta_final)
+                break
+            messages.append({"role": "assistant", "content": _mc2.content or "", "tool_calls": [
+                {"id": _tc.id, "type": "function",
+                 "function": {"name": re.sub(r'[^\w]', '', re.split(r'[(\s<]', _tc.function.name or "")[0]),
+                              "arguments": _tc.function.arguments}}
+                for _tc in _tc2
+            ]})
+            _modo_cont = MODO_ACTUAL
+            for _tc in _tc2:
+                _n = re.sub(r'[^\w]', '', re.split(r'[(\s<]', (_tc.function.name or ""))[0])
+                try:
+                    _inp = json.loads((_tc.function.arguments or "").strip() or "{}")
+                except Exception:
+                    _inp = {}
+                if _detener_agente.is_set():
+                    break
+                print(f"[Herramienta: {_n}]")
+                _res = ejecutar_herramienta(_n, _inp)
+                _res_str = str(_res)
+                _prev = _res_str[:300] + ("…" if len(_res_str) > 300 else "")
+                print(f"[→ {_prev}]")
+                tool_log.append(f"{_n}({json.dumps(_inp, ensure_ascii=False, default=str)}) → {_res_str[:400]}")
+                messages.append({"role": "tool", "tool_call_id": _tc.id, "content": _res_str})
+            if MODO_ACTUAL != _modo_cont:
+                messages[0] = {"role": "system", "content": SYSTEM_PROMPT + _ZHIPU_ACTION_SUFFIX}
+        # while vuelve a verificar completitud tras el batch
+
+    # Guardar resumen de tools al historial para contexto del próximo turno
     if tool_log:
         resumen_tools = "Acciones realizadas este turno:\n" + "\n".join(f"  • {t}" for t in tool_log)
         _historial.append({"role": "assistant", "content": resumen_tools})
-        if not respuesta_final:
-            print("\nAcciones completadas:\n" + "\n".join(f"  • {t}" for t in tool_log))
     if respuesta_final:
         _historial.append({"role": "assistant", "content": respuesta_final})
 
@@ -1972,10 +2140,13 @@ if __name__ == "__main__":
         btn_rechazar.pack(side=tk.LEFT, padx=10)
 
         dialogo.update_idletasks()
-        dialogo.grab_set()
+        try:
+            dialogo.grab_set()
+        except Exception:
+            pass
         dialogo.lift()
         dialogo.attributes("-topmost", True)
-        dialogo.focus_force()
+        dialogo.after(50, lambda: dialogo.focus_set())
 
     def _solicitar_permiso_desde_hilo(nombre_modo, etiqueta, contenido):
         evento   = threading.Event()
@@ -1997,10 +2168,13 @@ if __name__ == "__main__":
         dialogo.geometry("540x240")
         dialogo.resizable(True, False)
         dialogo.configure(bg="#1e1e2e")
-        dialogo.grab_set()
+        try:
+            dialogo.grab_set()
+        except Exception:
+            pass
         dialogo.lift()
         dialogo.attributes("-topmost", True)
-        dialogo.focus_force()
+        dialogo.after(50, lambda: dialogo.focus_set())
 
         tk.Label(
             dialogo, text="Ruta del proyecto:",
@@ -2158,10 +2332,13 @@ if __name__ == "__main__":
         btn_no.pack(side=tk.LEFT, padx=10)
 
         dialogo.update_idletasks()
-        dialogo.grab_set()
+        try:
+            dialogo.grab_set()
+        except Exception:
+            pass
         dialogo.lift()
         dialogo.attributes("-topmost", True)
-        dialogo.focus_force()
+        dialogo.after(50, lambda: dialogo.focus_set())
 
     def _solicitar_confirmacion_desde_hilo(pregunta):
         evento    = threading.Event()
@@ -2319,7 +2496,7 @@ if __name__ == "__main__":
     # Abre sobre VS Code: -topmost activado brevemente al iniciar
     ventana.attributes("-topmost", True)
     ventana.lift()
-    ventana.focus_force()
+    ventana.after(50, lambda: ventana.focus_set())
     ventana.after(600, lambda: ventana.attributes("-topmost", False))
 
     # === Barra superior (header) ===
