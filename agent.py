@@ -1428,10 +1428,12 @@ _META_EXPLICACION_RE = re.compile(
     re.IGNORECASE
 )
 
-def correr_agente_anthropic(mensaje_usuario):
+def correr_agente_anthropic(mensaje_usuario, imagenes=None):
     global _historial
     _historial.append({"role": "user", "content": mensaje_usuario})
     messages = [{"role": e["role"], "content": e["content"]} for e in _historial]
+    if imagenes:
+        messages[-1]["content"] = _content_anthropic(mensaje_usuario, imagenes)
     while True:
         if _detener_agente.is_set():
             break
@@ -1456,10 +1458,16 @@ def correr_agente_anthropic(mensaje_usuario):
             messages.append({"role": "user", "content": tool_results})
 
 
-def correr_agente_ollama(mensaje_usuario):
+def correr_agente_ollama(mensaje_usuario, imagenes=None):
     global _historial
     tools_text = _formatear_herramientas_texto()
     system_con_tools = f"{SYSTEM_PROMPT}\n\n{tools_text}"
+    if imagenes:
+        nota = "\n".join(
+            f"[Imagen adjunta: {img['nombre']} — visión no disponible en Ollama]"
+            for img in imagenes
+        )
+        mensaje_usuario = mensaje_usuario + ("\n" if mensaje_usuario else "") + nota
     _historial.append({"role": "user", "content": mensaje_usuario})
     messages = [{"role": "system", "content": system_con_tools}]
     messages += [{"role": e["role"], "content": e["content"]} for e in _historial]
@@ -1572,9 +1580,15 @@ def compactar_historial():
     )
 
 
-def correr_agente_claude_code(mensaje_usuario):
+def correr_agente_claude_code(mensaje_usuario, imagenes=None):
     global _historial
     tools_text = _formatear_herramientas_texto()
+    if imagenes:
+        nota = "\n".join(
+            f"[Imagen adjunta: {img['nombre']} — visión no disponible en claude-code CLI]"
+            for img in imagenes
+        )
+        mensaje_usuario = mensaje_usuario + ("\n" if mensaje_usuario else "") + nota
     _historial.append({"role": "user", "content": mensaje_usuario})
     mensajes = [{"role": e["role"], "content": e["content"]} for e in _historial]
     _respuesta_asistente = ""
@@ -1802,7 +1816,7 @@ _ZHIPU_ACTION_SUFFIX = (
 )
 
 
-def correr_agente_zhipu(mensaje_usuario):
+def correr_agente_zhipu(mensaje_usuario, imagenes=None):
     global _historial
     if client is None:
         print(
@@ -1815,6 +1829,8 @@ def correr_agente_zhipu(mensaje_usuario):
     messages = [{"role": "system", "content": SYSTEM_PROMPT + _ZHIPU_ACTION_SUFFIX}]
     messages += [{"role": e["role"], "content": e["content"]} for e in _historial
                  if e["role"] in ("user", "assistant")]
+    if imagenes:
+        messages[-1]["content"] = _content_openai(mensaje_usuario, imagenes)
 
     import zai as _zai
     MAX_ITER = 10
@@ -2048,16 +2064,88 @@ def correr_agente_zhipu(mensaje_usuario):
         _historial.append({"role": "assistant", "content": respuesta_final})
 
 
-def correr_agente(mensaje_usuario):
+# === ADJUNTOS (imágenes y documentos) ===
+
+_EXTS_IMAGEN = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+def _procesar_adjuntos(texto_usuario, rutas):
+    """Extrae texto de docs e imágenes en base64.
+    Retorna (texto_enriquecido: str, imagenes: list[dict])."""
+    import base64
+    partes = [texto_usuario]
+    imagenes = []
+    for ruta in rutas:
+        ext = os.path.splitext(ruta)[1].lower()
+        nombre = os.path.basename(ruta)
+        if ext in _EXTS_IMAGEN:
+            try:
+                with open(ruta, "rb") as f:
+                    data_b64 = base64.standard_b64encode(f.read()).decode()
+                media = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                         ".png": "image/png", ".gif": "image/gif",
+                         ".webp": "image/webp"}.get(ext, "image/jpeg")
+                imagenes.append({"nombre": nombre, "media_type": media, "data_b64": data_b64})
+            except Exception as e:
+                partes.append(f"\n[Error leyendo imagen '{nombre}': {e}]")
+        elif ext == ".pdf":
+            try:
+                import pdfplumber
+                with pdfplumber.open(ruta) as pdf:
+                    texto = "\n".join(p.extract_text() or "" for p in pdf.pages)
+                partes.append(f"\n\n[Documento adjunto — {nombre}]\n```\n{texto[:8000]}\n```")
+            except Exception:
+                partes.append(f"\n[Adjunto: {nombre} — instala pdfplumber para leer PDF]")
+        elif ext == ".docx":
+            try:
+                import docx as _docx
+                doc = _docx.Document(ruta)
+                texto = "\n".join(p.text for p in doc.paragraphs)
+                partes.append(f"\n\n[Documento adjunto — {nombre}]\n```\n{texto[:8000]}\n```")
+            except Exception as e:
+                partes.append(f"\n[Error leyendo docx '{nombre}': {e}]")
+        else:
+            try:
+                with open(ruta, "r", encoding="utf-8", errors="replace") as f:
+                    texto = f.read()
+                partes.append(f"\n\n[Archivo adjunto — {nombre}]\n```\n{texto[:8000]}\n```")
+            except Exception:
+                partes.append(f"\n[Adjunto: {nombre} — no se pudo leer]")
+    return "".join(partes), imagenes
+
+
+def _content_anthropic(texto, imagenes):
+    """Construye lista de content blocks para Anthropic API."""
+    content = [{"type": "text", "text": texto}]
+    for img in imagenes:
+        content.append({"type": "image", "source": {
+            "type": "base64",
+            "media_type": img["media_type"],
+            "data": img["data_b64"],
+        }})
+    return content
+
+
+def _content_openai(texto, imagenes):
+    """Construye lista de content blocks para APIs compatibles con OpenAI (ZhipuAI)."""
+    content = [{"type": "text", "text": texto}]
+    for img in imagenes:
+        content.append({"type": "image_url", "image_url": {
+            "url": f"data:{img['media_type']};base64,{img['data_b64']}"
+        }})
+    return content
+
+
+def correr_agente(mensaje_usuario, imagenes=None):
     print(f"[Backend: {BACKEND} | {MODOS_ETIQUETAS[MODO_ACTUAL]}]\n")
     if BACKEND == "anthropic":
-        correr_agente_anthropic(mensaje_usuario)
+        correr_agente_anthropic(mensaje_usuario, imagenes=imagenes)
     elif BACKEND == "ollama":
-        correr_agente_ollama(mensaje_usuario)
+        correr_agente_ollama(mensaje_usuario, imagenes=imagenes)
     elif BACKEND == "zhipu":
-        correr_agente_zhipu(mensaje_usuario)
+        correr_agente_zhipu(mensaje_usuario, imagenes=imagenes)
     elif BACKEND == "claude-code":
-        correr_agente_claude_code(mensaje_usuario)
+        correr_agente_claude_code(mensaje_usuario, imagenes=imagenes)
 
 
 # ============================================================
@@ -2070,6 +2158,8 @@ if __name__ == "__main__":
     import threading
     import queue
     import builtins
+
+    _adjuntos: list = []   # rutas de archivos pendientes de enviar
 
     msg_queue = queue.Queue()
     _print_original = builtins.print
@@ -2427,7 +2517,8 @@ if __name__ == "__main__":
 
     def enviar():
         mensaje = entrada.get("1.0", "end-1c").strip()
-        if not mensaje:
+        adjuntos_snap = list(_adjuntos)
+        if not mensaje and not adjuntos_snap:
             return
         entrada.delete("1.0", tk.END)
 
@@ -2443,12 +2534,23 @@ if __name__ == "__main__":
             agregar_texto(f"Sistema: {resultado}\n\n", "sistema")
             return
 
+        # Procesar adjuntos: extraer texto/base64 y limpiar lista
+        texto_final, imagenes = _procesar_adjuntos(mensaje, adjuntos_snap)
+        _adjuntos.clear()
+        _actualizar_chips()
+
         _actualizar_btn(False)
-        agregar_texto(f"Tú: {mensaje}\n", "usuario")
+        # Mostrar en chat con nombres de adjuntos
+        nombres = [os.path.basename(r) for r in adjuntos_snap]
+        display = mensaje
+        if nombres:
+            display = (mensaje + "\n" if mensaje else "") + "📎 " + ", ".join(nombres)
+        agregar_texto(f"Tú: {display}\n", "usuario")
         iniciar_procesando()
         _detener_agente.clear()
 
         _n_msgs = [0]
+        _imgs = imagenes if imagenes else None
 
         def print_a_cola(*args):
             texto = " ".join(str(a) for a in args)
@@ -2462,7 +2564,7 @@ if __name__ == "__main__":
             _n_msgs[0] = 0
             builtins.print = print_a_cola
             try:
-                correr_agente(mensaje)
+                correr_agente(texto_final, imagenes=_imgs)
                 if _n_msgs[0] == 0:
                     msg_queue.put(("sistema", "Agente finalizó sin respuesta visible. Sin cambios realizados.\n\n"))
                 else:
@@ -2727,6 +2829,57 @@ if __name__ == "__main__":
     frame = tk.Frame(ventana, bg=FONDO)
     frame.pack(fill=tk.X, side=tk.BOTTOM, padx=14, pady=10)
 
+    # === Frame de chips de adjuntos (aparece sobre la barra de entrada) ===
+    _chips_frame = tk.Frame(ventana, bg=FONDO)
+    _chips_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=18, pady=(0, 2))
+
+    def _actualizar_chips():
+        for w in _chips_frame.winfo_children():
+            w.destroy()
+        for ruta in list(_adjuntos):
+            nombre = os.path.basename(ruta)
+            chip = tk.Frame(_chips_frame, bg="#374151", padx=6, pady=2)
+            chip.pack(side=tk.LEFT, padx=(0, 6), pady=2)
+            tk.Label(
+                chip, text=nombre,
+                font=("Helvetica", 10), bg="#374151", fg="#e2e8f0"
+            ).pack(side=tk.LEFT)
+            btn_x = tk.Label(
+                chip, text=" ✕",
+                font=("Helvetica", 10, "bold"), bg="#374151", fg="#f38ba8",
+                cursor="hand2"
+            )
+            btn_x.bind(
+                "<Button-1>",
+                lambda e, r=ruta: (
+                    _adjuntos.remove(r) if r in _adjuntos else None,
+                    _actualizar_chips()
+                )
+            )
+            btn_x.pack(side=tk.LEFT)
+
+    def _adjuntar_archivo():
+        from tkinter import filedialog
+        rutas = filedialog.askopenfilenames(
+            title="Seleccionar imágenes o documentos",
+            filetypes=[
+                ("Imágenes y documentos",
+                 "*.png *.jpg *.jpeg *.gif *.webp *.pdf *.docx "
+                 "*.txt *.csv *.py *.js *.ts *.html *.css "
+                 "*.json *.yaml *.yml *.md *.sql *.sh"),
+                ("Imágenes", "*.png *.jpg *.jpeg *.gif *.webp"),
+                ("Documentos", "*.pdf *.docx *.txt *.csv"),
+                ("Código", "*.py *.js *.ts *.html *.css *.json *.yaml *.yml *.md *.sql *.sh"),
+                ("Todos los archivos", "*.*"),
+            ],
+            parent=ventana,
+        )
+        for r in rutas:
+            if r not in _adjuntos:
+                _adjuntos.append(r)
+        if rutas:
+            _actualizar_chips()
+
     _btn_activo = [True]
     _btn_detener_ref = [None]
 
@@ -2772,6 +2925,18 @@ if __name__ == "__main__":
     #       _btn_activo[0]=False significa agente procesando → detener habilitado.
     btn_detener.pack(side=tk.RIGHT, fill=tk.Y, pady=8, padx=(0, 6))
     _btn_detener_ref[0] = btn_detener
+
+    # Botón adjuntar archivo
+    btn_adjuntar = tk.Label(
+        frame, text="📎",
+        font=("Helvetica", 17),
+        bg=FONDO, fg="#6b7280",
+        padx=6, cursor="hand2"
+    )
+    btn_adjuntar.bind("<Button-1>", lambda e: _adjuntar_archivo())
+    btn_adjuntar.bind("<Enter>", lambda e: btn_adjuntar.config(fg="#3b82f6"))
+    btn_adjuntar.bind("<Leave>", lambda e: btn_adjuntar.config(fg="#6b7280"))
+    btn_adjuntar.pack(side=tk.LEFT, fill=tk.Y, pady=8, padx=(0, 2))
 
     entrada_frame = tk.Frame(
         frame, bg=FONDO2,
