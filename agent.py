@@ -32,6 +32,11 @@ CUSTOM_MODES_FILE = "custom_modes.json"
 AGENT_DIR = os.path.abspath(os.path.dirname(__file__))
 RUTA_PROYECTO = [None]
 
+# ---- Contexto de sesión ----
+CONTEXTO_FILE_NAME = "agent_context.json"
+RUTA_CONTEXTO_PREFERIDA = [None]
+_CONTEXTO_PREFS_FILE = os.path.join(AGENT_DIR, "context_prefs.json")
+
 
 def cargar_prompt(modo):
     archivo = MODOS.get(modo, MODOS["default"])
@@ -51,6 +56,59 @@ def guardar_conocimiento(modo, entries):
     archivo = f"knowledge_{modo}.json"
     with open(archivo, "w", encoding="utf-8") as f:
         json.dump({"entries": entries}, f, indent=2, ensure_ascii=False)
+
+
+# ---- Persistencia de contexto de sesión ----
+
+def _cargar_pref_ruta_contexto():
+    """Carga la ruta preferida de guardado de contexto desde prefs."""
+    if os.path.exists(_CONTEXTO_PREFS_FILE):
+        try:
+            with open(_CONTEXTO_PREFS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f).get("ruta_contexto")
+        except Exception:
+            pass
+    return None
+
+
+def _guardar_pref_ruta_contexto(ruta):
+    """Persiste la ruta elegida para guardar contexto."""
+    try:
+        with open(_CONTEXTO_PREFS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"ruta_contexto": ruta}, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def guardar_contexto_sesion(ruta_dir):
+    """Guarda el historial y estado actual en ruta_dir/agent_context.json."""
+    import datetime
+    archivo = os.path.join(ruta_dir, CONTEXTO_FILE_NAME)
+    datos = {
+        "modo": MODO_ACTUAL,
+        "backend": BACKEND,
+        "modelo": MODELO,
+        "ruta_proyecto": RUTA_PROYECTO[0],
+        "historial": list(_historial),
+        "guardado_en": datetime.datetime.now().isoformat(),
+    }
+    with open(archivo, "w", encoding="utf-8") as f:
+        json.dump(datos, f, indent=2, ensure_ascii=False)
+    _guardar_pref_ruta_contexto(ruta_dir)
+    RUTA_CONTEXTO_PREFERIDA[0] = ruta_dir
+    return archivo
+
+
+def cargar_contexto_sesion(ruta_dir):
+    """Carga contexto desde ruta_dir/agent_context.json. Retorna dict o None."""
+    archivo = os.path.join(ruta_dir, CONTEXTO_FILE_NAME)
+    if not os.path.exists(archivo):
+        return None
+    try:
+        with open(archivo, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def construir_system_prompt(modo):
@@ -133,9 +191,10 @@ SYSTEM_PROMPT = construir_system_prompt(MODO_ACTUAL)
 # _solicitar_permiso:     fn(nombre_modo, etiqueta, contenido_prompt) -> bool
 # _solicitar_ruta:        fn() -> str | None
 # _solicitar_confirmacion: fn(pregunta) -> bool
-_solicitar_permiso      = [None]
-_solicitar_ruta         = [None]
-_solicitar_confirmacion = [None]
+_solicitar_permiso            = [None]
+_solicitar_ruta               = [None]
+_solicitar_confirmacion       = [None]
+_notificar_ruta_proyecto      = [None]  # cb(ruta) — llamado cuando RUTA_PROYECTO[0] cambia
 
 
 # ============================================================
@@ -581,6 +640,7 @@ def cargar_herramientas_custom():
 
 cargar_modos_custom()
 cargar_herramientas_custom()
+RUTA_CONTEXTO_PREFERIDA[0] = _cargar_pref_ruta_contexto()
 
 
 # ============================================================
@@ -765,7 +825,23 @@ def _despachar_herramienta(nombre, inputs):
                 ruta_resuelta = os.path.join(AGENT_DIR, ruta_sugerida)
             ruta_resuelta = os.path.abspath(ruta_resuelta)
             if os.path.isdir(ruta_resuelta):
+                # Si ya hay una ruta activa diferente, pedir confirmación antes de cambiarla
+                if RUTA_PROYECTO[0] and os.path.abspath(RUTA_PROYECTO[0]) != ruta_resuelta:
+                    if _solicitar_confirmacion[0]:
+                        aprobado = _solicitar_confirmacion[0](
+                            f"El agente quiere cambiar la ruta del proyecto:\n\n"
+                            f"  Actual:  {RUTA_PROYECTO[0]}\n"
+                            f"  Nueva:   {ruta_resuelta}\n\n"
+                            f"¿Autorizas el cambio?"
+                        )
+                        if not aprobado:
+                            return (
+                                f"El usuario rechazó el cambio de ruta. "
+                                f"Continúa usando la ruta actual: {RUTA_PROYECTO[0]}"
+                            )
                 RUTA_PROYECTO[0] = ruta_resuelta
+                if _notificar_ruta_proyecto[0]:
+                    _notificar_ruta_proyecto[0](ruta_resuelta)
                 return (
                     f"Ruta del proyecto configurada automáticamente: {ruta_resuelta}\n"
                     f"IMPORTANTE: ruta_relativa es RELATIVA a esa carpeta raíz.\n"
@@ -861,6 +937,52 @@ def _despachar_herramienta(nombre, inputs):
                 f"Error: '{inputs.get('ruta_relativa')}' no existe o no es un archivo.\n"
                 f"Usa listar_archivos con ruta_relativa='' para ver los archivos disponibles."
             )
+        # --- Lectura de PDF ---
+        if ruta_abs.lower().endswith(".pdf"):
+            try:
+                import pdfplumber
+                with pdfplumber.open(ruta_abs) as pdf:
+                    texto = "\n".join(p.extract_text() or "" for p in pdf.pages)
+                if not texto.strip():
+                    return (
+                        f"[PDF SIN TEXTO] '{inputs.get('ruta_relativa')}' no tiene texto extraíble "
+                        f"(puede ser imagen escaneada o PDF protegido)."
+                    )
+                return texto
+            except ImportError:
+                return (
+                    "Error: 'pdfplumber' no instalado.\n"
+                    "Ejecuta: pip install pdfplumber"
+                )
+            except Exception as e:
+                return f"Error al leer PDF '{ruta_abs}': {type(e).__name__}: {e}"
+
+        # --- Lectura de Excel (.xlsx / .xls) ---
+        if ruta_abs.lower().endswith((".xlsx", ".xls")):
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(ruta_abs, read_only=True, data_only=True)
+                partes = []
+                for hoja in wb.sheetnames:
+                    ws = wb[hoja]
+                    partes.append(f"=== Hoja: {hoja} ===")
+                    for fila in ws.iter_rows(values_only=True):
+                        celdas = [str(c) if c is not None else "" for c in fila]
+                        if any(c.strip() for c in celdas):
+                            partes.append(" | ".join(celdas))
+                wb.close()
+                contenido = "\n".join(partes)
+                if not contenido.strip():
+                    return f"[EXCEL VACÍO] '{inputs.get('ruta_relativa')}' no tiene datos extraíbles."
+                return contenido
+            except ImportError:
+                return (
+                    "Error: 'openpyxl' no instalado.\n"
+                    "Ejecuta: pip install openpyxl"
+                )
+            except Exception as e:
+                return f"Error al leer Excel '{ruta_abs}': {type(e).__name__}: {e}"
+
         # --- Auto-conversión de .docx a texto plano ---
         if ruta_abs.lower().endswith(".docx"):
             try:
@@ -2093,17 +2215,55 @@ def _procesar_adjuntos(texto_usuario, rutas):
                 import pdfplumber
                 with pdfplumber.open(ruta) as pdf:
                     texto = "\n".join(p.extract_text() or "" for p in pdf.pages)
-                partes.append(f"\n\n[Documento adjunto — {nombre}]\n```\n{texto[:8000]}\n```")
-            except Exception:
-                partes.append(f"\n[Adjunto: {nombre} — instala pdfplumber para leer PDF]")
+                if texto.strip():
+                    partes.append(f"\n\n[Documento adjunto — {nombre}]\n```\n{texto[:8000]}\n```")
+                else:
+                    partes.append(
+                        f"\n[Adjunto: {nombre} — PDF sin texto extraíble (puede ser imagen escaneada). "
+                        f"Informa al usuario que el PDF no contiene texto seleccionable.]"
+                    )
+            except ImportError:
+                partes.append(
+                    f"\n[DEPENDENCIA FALTANTE] No se pudo leer '{nombre}': pdfplumber no está instalado.\n"
+                    f"Informa al usuario: 'Para leer PDFs ejecuta: pip install pdfplumber'"
+                )
+            except Exception as e:
+                partes.append(f"\n[Error leyendo PDF '{nombre}': {type(e).__name__}: {e}]")
         elif ext == ".docx":
             try:
                 import docx as _docx
                 doc = _docx.Document(ruta)
                 texto = "\n".join(p.text for p in doc.paragraphs)
                 partes.append(f"\n\n[Documento adjunto — {nombre}]\n```\n{texto[:8000]}\n```")
+            except ImportError:
+                partes.append(
+                    f"\n[DEPENDENCIA FALTANTE] No se pudo leer '{nombre}': python-docx no está instalado.\n"
+                    f"Informa al usuario: 'Para leer DOCX ejecuta: pip install python-docx'"
+                )
             except Exception as e:
                 partes.append(f"\n[Error leyendo docx '{nombre}': {e}]")
+        elif ext in (".xlsx", ".xls"):
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+                filas = []
+                for hoja in wb.sheetnames:
+                    ws = wb[hoja]
+                    filas.append(f"=== Hoja: {hoja} ===")
+                    for fila in ws.iter_rows(values_only=True):
+                        celdas = [str(c) if c is not None else "" for c in fila]
+                        if any(c.strip() for c in celdas):
+                            filas.append(" | ".join(celdas))
+                wb.close()
+                texto = "\n".join(filas)
+                partes.append(f"\n\n[Excel adjunto — {nombre}]\n```\n{texto[:8000]}\n```")
+            except ImportError:
+                partes.append(
+                    f"\n[DEPENDENCIA FALTANTE] No se pudo leer '{nombre}': openpyxl no está instalado.\n"
+                    f"Informa al usuario: 'Para leer Excel ejecuta: pip install openpyxl'"
+                )
+            except Exception as e:
+                partes.append(f"\n[Error leyendo Excel '{nombre}': {e}]")
         else:
             try:
                 with open(ruta, "r", encoding="utf-8", errors="replace") as f:
@@ -2360,12 +2520,19 @@ if __name__ == "__main__":
         evento = threading.Event()
         def callback(ruta):
             RUTA_PROYECTO[0] = ruta
+            if ruta:
+                msg_queue.put(("verificar_contexto", ruta))
             evento.set()
         msg_queue.put(("ruta", callback))
         evento.wait()
         return RUTA_PROYECTO[0]
 
     _solicitar_ruta[0] = _solicitar_ruta_desde_hilo
+
+    def _al_cambiar_ruta_proyecto(ruta):
+        msg_queue.put(("verificar_contexto", ruta))
+
+    _notificar_ruta_proyecto[0] = _al_cambiar_ruta_proyecto
 
     def _mostrar_dialogo_confirmacion(pregunta, callback):
         dialogo = tk.Toplevel(ventana)
@@ -2457,6 +2624,128 @@ if __name__ == "__main__":
         area.see(tk.END)
         area.config(state="disabled")
 
+    # ---- Diálogo: cargar contexto previo ----
+    def _preguntar_cargar_contexto(ruta, ctx):
+        from tkinter import messagebox
+        fecha = ctx.get("guardado_en", "")[:16].replace("T", " ")
+        modo_guardado = ctx.get("modo", "?")
+        n_msgs = len(ctx.get("historial", []))
+        respuesta = messagebox.askyesno(
+            "Contexto previo encontrado",
+            f"Se encontró un contexto de sesión guardado en:\n{ruta}\n\n"
+            f"Fecha: {fecha}  |  Modo: {modo_guardado}  |  Mensajes: {n_msgs}\n\n"
+            "¿Deseas restaurar el historial de esa sesión?",
+            parent=ventana,
+        )
+        if not respuesta:
+            return
+        global _historial
+        historial_guardado = ctx.get("historial", [])
+        _historial.clear()
+        _historial.extend(historial_guardado)
+        ruta_proy = ctx.get("ruta_proyecto")
+        if ruta_proy and os.path.isdir(ruta_proy):
+            RUTA_PROYECTO[0] = ruta_proy
+        agregar_texto(
+            f"Sistema: Contexto restaurado — {n_msgs} mensajes desde {fecha}\n\n",
+            "sistema"
+        )
+
+    # ---- Diálogo: guardar contexto al cerrar ----
+    def _pedir_guardar_contexto_y_cerrar():
+        from tkinter import filedialog, messagebox
+
+        ruta_sugerida = RUTA_PROYECTO[0] or RUTA_CONTEXTO_PREFERIDA[0]
+
+        dialogo = tk.Toplevel(ventana)
+        dialogo.title("Guardar contexto de sesión")
+        dialogo.geometry("520x280")
+        dialogo.resizable(False, False)
+        dialogo.configure(bg="#1e1e2e")
+        try:
+            dialogo.grab_set()
+        except Exception:
+            pass
+        dialogo.lift()
+        dialogo.attributes("-topmost", True)
+        dialogo.after(50, lambda: dialogo.focus_set())
+
+        tk.Label(
+            dialogo, text="💾  ¿Guardar contexto de sesión?",
+            font=("Helvetica", 13, "bold"), bg="#1e1e2e", fg="#e2e8f0"
+        ).pack(pady=(20, 6), padx=20, anchor="w")
+
+        tk.Label(
+            dialogo,
+            text="Guarda el historial para recuperarlo la próxima vez que abras este proyecto.",
+            font=("Helvetica", 10), fg="#6b7280", bg="#1e1e2e",
+            justify="left", wraplength=480
+        ).pack(padx=20, anchor="w")
+
+        lbl_ruta_var = tk.StringVar(
+            value=f"📁  {ruta_sugerida}" if ruta_sugerida else "Sin ruta seleccionada"
+        )
+        lbl_ruta = tk.Label(
+            dialogo, textvariable=lbl_ruta_var,
+            font=("Helvetica", 10), fg="#a6e3a1", bg="#1e1e2e",
+            justify="left", wraplength=480
+        )
+        lbl_ruta.pack(padx=20, pady=(10, 0), anchor="w")
+
+        ruta_elegida = [ruta_sugerida]
+
+        def _cerrar_sin_guardar():
+            dialogo.destroy()
+            ventana.destroy()
+
+        def _guardar_en(ruta):
+            if not ruta:
+                return
+            try:
+                guardar_contexto_sesion(ruta)
+                dialogo.destroy()
+                ventana.destroy()
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo guardar:\n{e}", parent=dialogo)
+
+        def _cambiar_ruta():
+            dialogo.attributes("-topmost", False)
+            nueva = filedialog.askdirectory(
+                title="Seleccionar carpeta para guardar el contexto",
+                initialdir=ruta_elegida[0] or AGENT_DIR,
+                parent=dialogo,
+            )
+            dialogo.attributes("-topmost", True)
+            dialogo.lift()
+            if nueva:
+                ruta_elegida[0] = nueva
+                lbl_ruta_var.set(f"📁  {nueva}")
+
+        frame_btns = tk.Frame(dialogo, bg="#1e1e2e")
+        frame_btns.pack(pady=20)
+
+        estilos_btn = dict(font=("Helvetica", 11, "bold"), padx=12, pady=5, cursor="hand2")
+
+        btn_guardar = tk.Label(frame_btns, text="✓  Guardar aquí", bg="#15803d", fg="white", **estilos_btn)
+        btn_guardar.bind("<Button-1>", lambda e: _guardar_en(ruta_elegida[0]))
+        btn_guardar.bind("<Enter>", lambda e: btn_guardar.config(bg="#166534"))
+        btn_guardar.bind("<Leave>", lambda e: btn_guardar.config(bg="#15803d"))
+        btn_guardar.pack(side=tk.LEFT, padx=6)
+
+        btn_cambiar = tk.Label(frame_btns, text="📂  Cambiar ruta", bg="#4f46e5", fg="white", **estilos_btn)
+        btn_cambiar.bind("<Button-1>", lambda e: _cambiar_ruta())
+        btn_cambiar.bind("<Enter>", lambda e: btn_cambiar.config(bg="#4338ca"))
+        btn_cambiar.bind("<Leave>", lambda e: btn_cambiar.config(bg="#4f46e5"))
+        btn_cambiar.pack(side=tk.LEFT, padx=6)
+
+        btn_no = tk.Label(frame_btns, text="✗  No guardar", bg="#b91c1c", fg="white", **estilos_btn)
+        btn_no.bind("<Button-1>", lambda e: _cerrar_sin_guardar())
+        btn_no.bind("<Enter>", lambda e: btn_no.config(bg="#991b1b"))
+        btn_no.bind("<Leave>", lambda e: btn_no.config(bg="#b91c1c"))
+        btn_no.pack(side=tk.LEFT, padx=6)
+
+        dialogo.protocol("WM_DELETE_WINDOW", _cerrar_sin_guardar)
+
     def check_queue():
         try:
             while True:
@@ -2470,6 +2759,11 @@ if __name__ == "__main__":
                     elif tag == "confirmacion":
                         pregunta, cb = contenido
                         _mostrar_dialogo_confirmacion(pregunta, cb)
+                    elif tag == "verificar_contexto":
+                        ruta = contenido
+                        ctx = cargar_contexto_sesion(ruta)
+                        if ctx:
+                            _preguntar_cargar_contexto(ruta, ctx)
                     elif tag == "modo":
                         ventana.title(titulo_ventana())
                         agregar_texto(f"\n— Modo: {MODOS_ETIQUETAS[contenido]} —\n\n", "modo")
@@ -2993,6 +3287,14 @@ if __name__ == "__main__":
     area.tag_config("error",   foreground="#f38ba8", font=("Menlo", 12))
     area.tag_config("modo",    foreground="#cba6f7", font=("Menlo", 12, "italic"))
     area.tag_config("sistema", foreground="#a6adc8", font=("Menlo", 11, "italic"))
+
+    def _on_cierre_ventana():
+        if not _historial:
+            ventana.destroy()
+            return
+        _pedir_guardar_contexto_y_cerrar()
+
+    ventana.protocol("WM_DELETE_WINDOW", _on_cierre_ventana)
 
     check_queue()
     ventana.mainloop()
