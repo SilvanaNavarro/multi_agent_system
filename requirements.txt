@@ -1,15 +1,23 @@
 # ── Core ──────────────────────────────────────────────────────
-python-dotenv>=1.0.0
+python-dotenv>=1.2.0          # Cargar variables de entorno desde .env
 
-# ── Backends LLM ──────────────────────────────────────────────
-anthropic>=0.40.0
-ollama>=0.3.0
-zai-sdk>=0.1.0
+# ── Backends LLM (instala solo el que vayas a usar) ───────────
+anthropic>=0.111.0            # Backend "anthropic"  → pip install anthropic
+ollama>=0.6.0                 # Backend "ollama"     → pip install ollama
+zai-sdk>=0.2.0                # Backend "zhipu"      → pip install zai-sdk
+certifi>=2024.0.0             # SSL para zhipu       → pip install certifi
 
-# ── Lectura de documentos ─────────────────────────────────────
-pdfplumber>=0.11.0        # PDF → texto
-python-docx>=1.1.0        # DOCX → texto
-openpyxl>=3.1.0           # XLSX / XLS → texto
+# ── Lectura de documentos adjuntos ───────────────────────────
+pdfplumber>=0.11.0            # PDF → texto          → pip install pdfplumber
+python-docx>=1.1.0            # DOCX → texto         → pip install python-docx
+openpyxl>=3.1.0               # XLSX/XLS → texto     → pip install openpyxl
 
-# ── Imágenes (si se necesita procesamiento local) ─────────────
-Pillow>=10.0.0
+# ── Imágenes y portapapeles ───────────────────────────────────
+Pillow>=10.0.0                # Ctrl+V capturas de pantalla (ImageGrab)
+                              #                       → pip install Pillow
+
+# ── Drag-and-drop desde el explorador (opcional) ─────────────
+# tkinterdnd2>=0.3.0          # Arrastrar archivos al chat
+#                             → pip install tkinterdnd2
+#                             Sin esta librería todo funciona igual;
+#                             solo se pierde el drag-and-drop externo.

@@ -140,10 +140,12 @@ def construir_system_prompt(modo):
 
     switching_rule = (
         "\n\n## REGLA DE CAMBIO DE EXPERTO\n"
-        "Cambia de modo según el DOMINIO de la solicitud, NO según si las herramientas disponibles pueden ejecutarla.\n"
+        "⚠️  SOLO aplica cuando la intención sea EJECUCIÓN (crear, implementar, configurar, generar).\n"
+        "    Si el usuario PREGUNTA sobre un tema técnico, responde directamente — NO cambies de modo.\n\n"
+        "Cambia de modo según el DOMINIO de la solicitud de ejecución:\n"
         "Las herramientas (editar_archivo, leer_archivo, etc.) existen en TODOS los modos — su presencia NO evita el cambio.\n"
-        "El cambio de modo activa el experto correcto para dar respuestas de mayor calidad.\n\n"
-        "CUÁNDO cambiar (usa el modo indicado sin excepciones):\n"
+        "El cambio de modo activa el experto correcto para ejecutar con mayor calidad.\n\n"
+        "CUÁNDO cambiar (solo si la intención es ejecutar, crear o modificar):\n"
         "- HTML / CSS / JS / React / diseño web / impresión / PDF / frontend → 'fullstack'\n"
         "- Seguridad / vulnerabilidades / auth / pentesting → 'ciberseguridad'\n"
         "- Pipelines de datos / ETL / SQL analytics / BigQuery → 'data_engineer'\n"
@@ -169,20 +171,83 @@ def construir_system_prompt(modo):
         "Esto devuelve el control al Project Manager para coordinar la siguiente solicitud."
     ) if modo != "default" else ""
 
-    approval_rule = (
-        "\n\n## REGLA DE APROBACIÓN OBLIGATORIA — MODIFICACIÓN DE ARCHIVOS\n"
-        "ANTES de llamar a editar_archivo o crear_archivo SIEMPRE debes:\n"
-        "1. Escribir un mensaje al usuario explicando QUÉ cambios planeas hacer y POR QUÉ.\n"
-        "2. Llamar a pedir_confirmacion con un resumen de TODOS los cambios planeados.\n"
-        "3. Solo si el usuario aprueba, ejecutar las herramientas de edición.\n"
-        "NUNCA edites ni crees archivos sin haber explicado el plan y recibido aprobación explícita.\n"
-        "Esta regla es ABSOLUTA — aplica sin excepción a todos los modos y backends."
+    intent_rule = (
+        "\n\n## REGLA DE INTENCIÓN — PREGUNTA vs EJECUCIÓN\n"
+        "Antes de usar cualquier herramienta o crear archivos, determina la intención del usuario:\n\n"
+        "PREGUNTA / CONSULTA — señales: ¿cómo?, ¿qué es?, explícame, ¿es posible?, ¿conviene?, "
+        "¿cómo puedes ayudarme?, ¿qué puedes hacer?\n"
+        "→ Responde con texto. NO llames herramientas. NO crees archivos.\n\n"
+        "EJECUCIÓN — señales claras: crea, genera, implementa, configura, arma, escribe, hazme, "
+        "empieza ya.\n"
+        "⚠️  'quiero X', 'necesito X', 'quisiera X' SIN imperativo directo = AMBIGUO, no EJECUCIÓN.\n"
+        "→ Usa herramientas y crea archivos según corresponda.\n\n"
+        "AMBIGUO — el enunciado mezcla intención de hacer algo con una pregunta, o usa 'quiero/necesito'.\n"
+        "→ Haz UNA pregunta de aclaración antes de ejecutar cualquier herramienta.\n"
+        "   Ejemplo: '¿Quieres que empiece ahora o prefieres que te explique primero cómo puedo ayudarte?'\n\n"
+        "⛔ NUNCA pidas la ruta del proyecto en texto. Si necesitas acceder a archivos, es señal de que\n"
+        "   debes cambiar al experto técnico con cambiar_modo() — el experto llama solicitar_ruta_proyecto()."
     )
 
+    approval_rule = (
+        "\n\n## REGLA DE APROBACIÓN — MODIFICACIÓN DE ARCHIVOS\n"
+        "ANTES de modificar archivos SIEMPRE debes:\n"
+        "1. Explicar en texto QUÉ cambios planeas hacer y POR QUÉ.\n"
+        "2. Llamar pedir_confirmacion UNA SOLA VEZ con el resumen de TODOS los cambios.\n"
+        "3. Solo si el usuario aprueba, ejecutar las herramientas — sin más confirmaciones.\n\n"
+        "## REGLA DE EDICIÓN EN LOTE\n"
+        "Si necesitas modificar 3 o más secciones del mismo archivo:\n"
+        "  → USA crear_archivo con el contenido COMPLETO del archivo ya modificado.\n"
+        "  → NO hagas N llamadas a editar_archivo — genera una sola versión final.\n"
+        "Si son 1 o 2 cambios puntuales en un archivo grande:\n"
+        "  → USA editar_archivo (texto_original / texto_nuevo) para cada cambio.\n"
+        "NUNCA llames pedir_confirmacion dentro de un loop de edits — una aprobación cubre todos."
+    )
+
+    ruta_rule = (
+        "\n\n## REGLA DE RUTA DE PROYECTO — OBLIGATORIA\n"
+        "Si necesitas acceder a archivos y la ruta del proyecto no está configurada:\n"
+        "→ Llama solicitar_ruta_proyecto() AHORA — sin preguntar, sin esperar.\n"
+        "Esta regla aplica SIEMPRE: proyectos nuevos Y proyectos existentes.\n"
+        "NUNCA preguntes la ruta al usuario con texto. La herramienta abre el selector automáticamente."
+    ) if modo != "default" else ""
+
+    # Regla de autodescrpción: solo inyectada en el PM para que pueda responder con precisión
+    # cuando el usuario pregunta qué puede hacer el sistema para una tarea específica.
+    # Usa globals().get porque esta función se llama por primera vez ANTES de que TOOLS
+    # esté definido (línea 218 < línea 289), así que el fallback es lista vacía.
+    capabilities_rule = ""
+    if modo == "default":
+        _tools_snapshot = globals().get("TOOLS", [])
+        _herramientas_lista = "\n".join(
+            f"  - {t['name']}: {t['description'][:120]}"
+            for t in _tools_snapshot
+        )
+        _expertos_lista = "\n".join(
+            f"  - {k} ({v})"
+            for k, v in MODOS_ETIQUETAS.items()
+            if k != "default"
+        )
+        capabilities_rule = (
+            "\n\n## REGLA DE AUTODESCRPCIÓN — CAPACIDADES DEL SISTEMA\n"
+            "Si el usuario pregunta qué puedes hacer, qué herramientas tienes, cuáles son tus capacidades,"
+            " o pide que describas cómo podrías ayudar con una tarea específica:\n"
+            "NUNCA respondas definiendo la tarea ni explicando qué ES esa tarea.\n"
+            "SIEMPRE describe con precisión LO QUE EL SISTEMA PUEDE HACER usando:\n\n"
+            "EXPERTOS DISPONIBLES (se activan según el dominio):\n"
+            f"{_expertos_lista}\n\n"
+            "HERRAMIENTAS TÉCNICAS QUE EL SISTEMA PUEDE EJECUTAR:\n"
+            f"{_herramientas_lista}\n\n"
+            "Al responder, conecta explícitamente cada herramienta/experto con la tarea concreta que el usuario mencionó.\n"
+            "Ejemplo correcto: 'Para ejecutar ese proyecto puedo: leer y editar tus archivos con leer_archivo/"
+            "editar_archivo, crear la estructura de carpetas con crear_carpeta, y activar al experto fullstack"
+            " para el frontend o al data_engineer para los pipelines.'\n"
+            "Ejemplo INCORRECTO: 'Un proyecto de X es un sistema que permite...' — eso define la tarea, no tus capacidades."
+        )
+
     if not entries:
-        return base + switching_rule + approval_rule + return_rule
+        return base + switching_rule + capabilities_rule + ruta_rule + intent_rule + approval_rule + return_rule
     conocimiento_txt = "\n".join(f"- [{e['tema']}]: {e['contenido']}" for e in entries)
-    return f"{base}{switching_rule}{approval_rule}{return_rule}\n\n## CONOCIMIENTO ACUMULADO DE EXPERIENCIAS PREVIAS\n{conocimiento_txt}"
+    return f"{base}{switching_rule}{capabilities_rule}{ruta_rule}{intent_rule}{approval_rule}{return_rule}\n\n## CONOCIMIENTO ACUMULADO DE EXPERIENCIAS PREVIAS\n{conocimiento_txt}"
 
 
 SYSTEM_PROMPT = construir_system_prompt(MODO_ACTUAL)
@@ -433,7 +498,9 @@ TOOLS = [
         "name": "editar_archivo",
         "description": (
             "Reemplaza un fragmento de texto en un archivo existente del proyecto. "
-            "Úsala para modificar URLs, variables, bloques de código, etc. sin reescribir el archivo completo."
+            "USA ESTA HERRAMIENTA solo para 1 o 2 cambios puntuales en un archivo grande. "
+            "Si necesitas 3 o más cambios en el mismo archivo, usa crear_archivo con el contenido completo — "
+            "es más rápido, confiable y requiere una sola aprobación del usuario."
         ),
         "input_schema": {
             "type": "object",
@@ -550,6 +617,28 @@ TOOLS = [
             "type": "object",
             "properties": {},
             "required": []
+        }
+    },
+    {
+        "name": "instalar_libreria",
+        "description": (
+            "Instala una librería Python con pip previa confirmación del usuario. "
+            "Úsala cuando una herramienta falle por dependencia faltante (ImportError). "
+            "Tras instalar exitosamente, reintenta la herramienta original."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "paquete": {
+                    "type": "string",
+                    "description": "Nombre del paquete pip, ej: 'pdfplumber', 'python-docx', 'openpyxl'"
+                },
+                "motivo": {
+                    "type": "string",
+                    "description": "Para qué se necesita, ej: 'leer archivos PDF'"
+                }
+            },
+            "required": ["paquete"]
         }
     }
 ]
@@ -951,8 +1040,9 @@ def _despachar_herramienta(nombre, inputs):
                 return texto
             except ImportError:
                 return (
-                    "Error: 'pdfplumber' no instalado.\n"
-                    "Ejecuta: pip install pdfplumber"
+                    "DEPENDENCIA FALTANTE: 'pdfplumber' no instalado.\n"
+                    "Llama instalar_libreria(paquete='pdfplumber', motivo='leer archivos PDF') "
+                    "y luego reintenta leer_archivo."
                 )
             except Exception as e:
                 return f"Error al leer PDF '{ruta_abs}': {type(e).__name__}: {e}"
@@ -977,8 +1067,9 @@ def _despachar_herramienta(nombre, inputs):
                 return contenido
             except ImportError:
                 return (
-                    "Error: 'openpyxl' no instalado.\n"
-                    "Ejecuta: pip install openpyxl"
+                    "DEPENDENCIA FALTANTE: 'openpyxl' no instalado.\n"
+                    "Llama instalar_libreria(paquete='openpyxl', motivo='leer archivos Excel') "
+                    "y luego reintenta leer_archivo."
                 )
             except Exception as e:
                 return f"Error al leer Excel '{ruta_abs}': {type(e).__name__}: {e}"
@@ -1017,8 +1108,9 @@ def _despachar_herramienta(nombre, inputs):
                 )
             except ImportError:
                 return (
-                    "Error: 'python-docx' no instalado.\n"
-                    "Ejecuta: pip3 install python-docx"
+                    "DEPENDENCIA FALTANTE: 'python-docx' no instalado.\n"
+                    "Llama instalar_libreria(paquete='python-docx', motivo='leer archivos DOCX') "
+                    "y luego reintenta leer_archivo."
                 )
             except Exception as e:
                 return f"Error al leer .docx '{ruta_abs}': {type(e).__name__}: {e}"
@@ -1050,19 +1142,9 @@ def _despachar_herramienta(nombre, inputs):
                 f"Error: '{inputs['ruta_relativa']}' no existe o no es un archivo.\n"
                 f"Usa listar_archivos con ruta_relativa='' para ver los archivos disponibles."
             )
-        if _solicitar_confirmacion[0]:
-            orig_preview = inputs["texto_original"][:200].replace("\n", "↵")
-            nuevo_preview = inputs["texto_nuevo"][:200].replace("\n", "↵")
-            pregunta = (
-                f"El agente quiere EDITAR '{inputs['ruta_relativa']}'.\n\n"
-                f"Reemplazar:\n{orig_preview}"
-                f"{'…' if len(inputs['texto_original']) > 200 else ''}\n\n"
-                f"Con:\n{nuevo_preview}"
-                f"{'…' if len(inputs['texto_nuevo']) > 200 else ''}"
-            )
-            aprobado = _solicitar_confirmacion[0](pregunta)
-            if not aprobado:
-                return f"El usuario rechazó editar '{inputs['ruta_relativa']}'. No se realizó ningún cambio."
+        # Sin confirmación por edición individual — el agente debe usar pedir_confirmacion
+        # UNA sola vez antes de ejecutar todos los cambios del plan. Pedir confirmación aquí
+        # provoca N diálogos para N edits sobre el mismo archivo.
         try:
             with open(ruta_abs, "r", encoding="utf-8") as f:
                 contenido = f.read()
@@ -1378,6 +1460,44 @@ def _despachar_herramienta(nombre, inputs):
         reporte.append("4. Múltiples @media print → consolidar en uno")
         reporte.append("\nRevisa cada ⚠️ arriba y corrige en ese orden.")
         return "\n".join(reporte)
+
+    if nombre == "instalar_libreria":
+        import subprocess, sys as _sys
+        paquete = inputs.get("paquete", "").strip()
+        motivo  = inputs.get("motivo",  "").strip()
+        if not paquete:
+            return "Se requiere el parámetro 'paquete'."
+        pregunta = (
+            f"El agente necesita instalar una librería Python:\n\n"
+            f"  pip install {paquete}\n"
+            + (f"\nMotivo: {motivo}" if motivo else "")
+            + "\n\n¿Autorizar instalación?"
+        )
+        if _solicitar_confirmacion[0]:
+            aprobado = _solicitar_confirmacion[0](pregunta)
+        else:
+            aprobado = False
+        if not aprobado:
+            return f"El usuario rechazó instalar '{paquete}'. Informa que debe instalarlo manualmente: pip install {paquete}"
+        try:
+            resultado = subprocess.run(
+                [_sys.executable, "-m", "pip", "install", paquete],
+                capture_output=True, text=True, timeout=120
+            )
+            if resultado.returncode == 0:
+                return (
+                    f"'{paquete}' instalado exitosamente.\n"
+                    f"Ahora REINTENTA la herramienta original que falló."
+                )
+            stderr_short = (resultado.stderr or "").strip()[-600:]
+            return (
+                f"Error al instalar '{paquete}' (código {resultado.returncode}):\n{stderr_short}\n"
+                f"El usuario puede intentar manualmente: pip install {paquete}"
+            )
+        except subprocess.TimeoutExpired:
+            return f"Timeout (120 s) al instalar '{paquete}'. El usuario puede intentarlo manualmente."
+        except Exception as e:
+            return f"Error inesperado al instalar '{paquete}': {type(e).__name__}: {e}"
 
     if nombre in HERRAMIENTAS_DINAMICAS:
         try:
@@ -2224,8 +2344,8 @@ def _procesar_adjuntos(texto_usuario, rutas):
                     )
             except ImportError:
                 partes.append(
-                    f"\n[DEPENDENCIA FALTANTE] No se pudo leer '{nombre}': pdfplumber no está instalado.\n"
-                    f"Informa al usuario: 'Para leer PDFs ejecuta: pip install pdfplumber'"
+                    f"\n[DEPENDENCIA FALTANTE] No se pudo leer '{nombre}': pdfplumber no instalado.\n"
+                    f"Llama instalar_libreria(paquete='pdfplumber', motivo='leer PDFs adjuntos') y reintenta."
                 )
             except Exception as e:
                 partes.append(f"\n[Error leyendo PDF '{nombre}': {type(e).__name__}: {e}]")
@@ -2237,8 +2357,8 @@ def _procesar_adjuntos(texto_usuario, rutas):
                 partes.append(f"\n\n[Documento adjunto — {nombre}]\n```\n{texto[:8000]}\n```")
             except ImportError:
                 partes.append(
-                    f"\n[DEPENDENCIA FALTANTE] No se pudo leer '{nombre}': python-docx no está instalado.\n"
-                    f"Informa al usuario: 'Para leer DOCX ejecuta: pip install python-docx'"
+                    f"\n[DEPENDENCIA FALTANTE] No se pudo leer '{nombre}': python-docx no instalado.\n"
+                    f"Llama instalar_libreria(paquete='python-docx', motivo='leer DOCX adjuntos') y reintenta."
                 )
             except Exception as e:
                 partes.append(f"\n[Error leyendo docx '{nombre}': {e}]")
@@ -2259,8 +2379,8 @@ def _procesar_adjuntos(texto_usuario, rutas):
                 partes.append(f"\n\n[Excel adjunto — {nombre}]\n```\n{texto[:8000]}\n```")
             except ImportError:
                 partes.append(
-                    f"\n[DEPENDENCIA FALTANTE] No se pudo leer '{nombre}': openpyxl no está instalado.\n"
-                    f"Informa al usuario: 'Para leer Excel ejecuta: pip install openpyxl'"
+                    f"\n[DEPENDENCIA FALTANTE] No se pudo leer '{nombre}': openpyxl no instalado.\n"
+                    f"Llama instalar_libreria(paquete='openpyxl', motivo='leer Excel adjunto') y reintenta."
                 )
             except Exception as e:
                 partes.append(f"\n[Error leyendo Excel '{nombre}': {e}]")
@@ -2882,8 +3002,15 @@ if __name__ == "__main__":
     AMARILLO = "#f9e2af"   # peach suave
     BORDE    = "#45475a"   # surface2 — bordes visibles sin ser duros
 
+    # Drag-and-drop desde el explorador (requiere: pip install tkinterdnd2)
+    try:
+        from tkinterdnd2 import TkinterDnD as _TkDnD, DND_FILES as _DND_FILES
+        _TIENE_DND = True
+    except ImportError:
+        _TIENE_DND = False
+
     # === Ventana principal ===
-    ventana = tk.Tk()
+    ventana = (_TkDnD.Tk() if _TIENE_DND else tk.Tk())
     ventana.title(titulo_ventana())
     ventana.geometry("800x620")
     ventana.minsize(540, 400)
@@ -3240,7 +3367,7 @@ if __name__ == "__main__":
 
     lbl_hint = tk.Label(
         entrada_frame,
-        text="Shift+Enter: nueva línea",
+        text="Shift+Enter: nueva línea  |  Ctrl+V: pegar captura  |  Arrastra archivos aquí",
         font=("Helvetica", 8), bg=FONDO2, fg="#6b7280",
         anchor="e", padx=6
     )
@@ -3270,6 +3397,33 @@ if __name__ == "__main__":
 
     entrada.bind("<Shift-Return>", _on_shift_return)
     entrada.bind("<Return>", _on_return)
+
+    # --- Pegar captura de pantalla desde el portapapeles (Ctrl+V / Cmd+V) ---
+    def _on_paste_clipboard(event):
+        """Si el portapapeles tiene imagen la adjunta; si tiene texto deja pasar el evento."""
+        try:
+            from PIL import ImageGrab
+            img = ImageGrab.grabclipboard()
+            if img is None:
+                return  # solo texto → paste normal
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=".png", delete=False, prefix="captura_", dir=AGENT_DIR
+            )
+            img.save(tmp.name, "PNG")
+            tmp.close()
+            if tmp.name not in _adjuntos:
+                _adjuntos.append(tmp.name)
+            _actualizar_chips()
+            return "break"  # consumir evento — no pegar como texto
+        except ImportError:
+            pass  # Pillow no instalado → paste normal
+        except Exception:
+            pass  # cualquier otro error → paste normal
+
+    entrada.bind("<Control-v>", _on_paste_clipboard)
+    entrada.bind("<Meta-v>",    _on_paste_clipboard)  # macOS Cmd+V
+
     entrada.focus()
 
     # === Área de chat — última en empaquetar para respetar los side=BOTTOM ===
@@ -3287,6 +3441,29 @@ if __name__ == "__main__":
     area.tag_config("error",   foreground="#f38ba8", font=("Menlo", 12))
     area.tag_config("modo",    foreground="#cba6f7", font=("Menlo", 12, "italic"))
     area.tag_config("sistema", foreground="#a6adc8", font=("Menlo", 11, "italic"))
+
+    # --- Drag-and-drop de archivos externos (requiere tkinterdnd2) ---
+    if _TIENE_DND:
+        def _on_drop(event):
+            try:
+                # splitlist maneja rutas con espacios y llaves en Windows/macOS
+                rutas = event.widget.tk.splitlist(event.data)
+            except Exception:
+                # fallback: limpiar llaves que tkinterdnd2 a veces agrega en Windows
+                raw = event.data or ""
+                rutas = [r.strip().strip("{}") for r in raw.split() if r.strip()]
+            nuevas = []
+            for r in rutas:
+                r = r.strip().strip("{}")
+                if r and os.path.isfile(r) and r not in _adjuntos:
+                    _adjuntos.append(r)
+                    nuevas.append(os.path.basename(r))
+            if nuevas:
+                _actualizar_chips()
+        # Registrar área de chat y campo de entrada como destinos de drop
+        for _widget_drop in (area, entrada):
+            _widget_drop.drop_target_register(_DND_FILES)
+            _widget_drop.dnd_bind("<<Drop>>", _on_drop)
 
     def _on_cierre_ventana():
         if not _historial:

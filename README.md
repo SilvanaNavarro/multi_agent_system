@@ -21,40 +21,143 @@ Un **sistema multi-agente** con orquestador y expertos especializados, con inter
 
 ---
 
+## Requisitos previos
+
+### Python 3.10 o superior
+
+**macOS/Linux**
+
+```bash
+python3 --version
+```
+
+Si no está instalado, en macOS:
+```bash
+brew install python
+```
+En Ubuntu/Debian:
+```bash
+sudo apt install python3 python3-venv python3-pip
+```
+
+**Windows**
+
+Descarga el instalador oficial desde [python.org/downloads](https://www.python.org/downloads/).
+
+Durante la instalación:
+- Marca **"Add Python to PATH"** (obligatorio)
+- Marca **"Install pip"**
+- Marca **"tcl/tk and IDLE"** (requerido para la GUI con tkinter)
+
+Verifica la instalación abriendo **PowerShell** o **CMD**:
+```powershell
+python --version
+pip --version
+```
+
+> En Windows el comando es `python` (no `python3`). En las instrucciones de este README se usa `python3` para macOS/Linux — reemplázalo por `python` si estás en Windows.
+
+### tkinter (GUI)
+
+Tkinter viene incluido con Python en Windows y macOS. En Linux puede requerir instalación manual:
+```bash
+sudo apt install python3-tk   # Ubuntu/Debian
+sudo dnf install python3-tkinter   # Fedora
+```
+
+---
+
 ## Instalación
 
-### 1. Ambiente virtual
+### 1. Clonar o descargar el repositorio
 
+```bash
+git clone <url-del-repo>
+cd Agente_test
+```
+
+### 2. Ambiente virtual
+
+**macOS / Linux**
 ```bash
 python3 -m venv env
-source env/bin/activate   # macOS/Linux
-# env\Scripts\activate   # Windows
+source env/bin/activate
 ```
 
-### 2. Dependencias según el backend elegido
-
-```bash
-# Para Zhipu/GLM (recomendado, gratis con registro)
-pip install zai-sdk certifi
-
-# Para Anthropic API
-pip install anthropic
-
-# Para Ollama (modelo local)
-pip install ollama
+**Windows — PowerShell**
+```powershell
+python -m venv env
+env\Scripts\Activate.ps1
 ```
 
-### 3. Configurar API key
+**Windows — CMD**
+```cmd
+python -m venv env
+env\Scripts\activate.bat
+```
 
-Crea un archivo `.env` en la raíz del proyecto:
+> Si PowerShell rechaza el script con un error de permisos de ejecución, ejecuta primero:
+> ```powershell
+> Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+> ```
+
+El prompt cambia a `(env)` cuando el ambiente está activo. Para desactivar: `deactivate`.
+
+### 3. Instalar dependencias
+
+**Instalación completa (recomendado):**
 
 ```bash
+pip install -r requirements.txt
+```
+
+**O por partes, según lo que vayas a usar:**
+
+```bash
+# Core (siempre requerido)
+pip install python-dotenv
+
+# Backend LLM — elige uno o varios
+pip install zai-sdk certifi      # Zhipu/GLM  (gratuito, recomendado)
+pip install anthropic             # Anthropic Claude
+pip install ollama                # Modelos locales
+
+# Lectura de documentos adjuntos (PDF, Word, Excel)
+pip install pdfplumber python-docx openpyxl
+
+# Pegar capturas de pantalla con Ctrl+V
+pip install Pillow
+
+# Drag-and-drop de archivos desde el explorador (opcional)
+pip install tkinterdnd2
+```
+
+> **Nota:** Si falta alguna dependencia al usar el sistema, el agente detecta el error y ofrece instalarla automáticamente con confirmación tuya — no necesitas instalar todo desde el principio.
+
+**Verificar instalación:**
+
+```bash
+python3 -c "import dotenv, anthropic, pdfplumber, docx, openpyxl, PIL; print('OK')"
+```
+
+En Windows:
+```powershell
+python -c "import dotenv, anthropic, pdfplumber, docx, openpyxl, PIL; print('OK')"
+```
+
+### 4. Configurar API key
+
+Crea un archivo `.env` en la raíz del proyecto (junto a `agent.py`):
+
+```
 # Para Zhipu (backend recomendado)
 ZAI_API_KEY=tu_clave_aqui
 
 # Para Anthropic (opcional)
 ANTHROPIC_API_KEY=tu_clave_aqui
 ```
+
+> En Windows puedes crear el archivo con el Bloc de notas: Archivo → Guardar como → nombre: `.env`, tipo: "Todos los archivos". Asegúrate de que no quede como `.env.txt`.
 
 El sistema carga `.env` automáticamente al iniciar.
 
@@ -86,7 +189,7 @@ El sistema carga `.env` automáticamente al iniciar.
 ### Ollama y Claude Code
 
 No requieren API key.
-- **Ollama**: instala con `brew install ollama` y descarga modelos con `ollama pull`
+- **Ollama**: ver sección de instalación más abajo
 - **Claude Code**: instala el CLI e inicia sesión con tu cuenta de claude.ai
 
 ---
@@ -103,76 +206,168 @@ BACKEND = "zhipu"   # "zhipu" | "anthropic" | "ollama" | "claude-code"
 
 Gratis con registro en [bigmodel.cn](https://bigmodel.cn). Soporta tool calling nativo.
 
+**macOS / Linux**
 ```bash
 export ZAI_API_KEY="tu_clave_de_zhipu"
-# BACKEND = "zhipu"
 python3 agent.py
 ```
 
+**Windows — PowerShell**
+```powershell
+$env:ZAI_API_KEY = "tu_clave_de_zhipu"
+python agent.py
+```
+
+**Windows — CMD**
+```cmd
+set ZAI_API_KEY=tu_clave_de_zhipu
+python agent.py
+```
+
+> O simplemente pon la clave en el archivo `.env` y no necesitas exportar nada.
+
 Modelo usado: `glm-4.5-flash` (configurable en `MODELOS_POR_BACKEND`).
+
+---
 
 ### Anthropic API
 
 Requiere API key y créditos (desde $5 USD en console.anthropic.com).
 
+**macOS / Linux**
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-# BACKEND = "anthropic"
 python3 agent.py
 ```
+
+**Windows — PowerShell**
+```powershell
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+python agent.py
+```
+
+**Windows — CMD**
+```cmd
+set ANTHROPIC_API_KEY=sk-ant-...
+python agent.py
+```
+
+---
 
 ### Ollama (modelo local, sin costo)
 
+**macOS**
 ```bash
 brew install ollama
 ollama serve
-ollama pull llama3.2   # en otra terminal
-# BACKEND = "ollama"
+# En otra terminal:
+ollama pull llama3.2
 python3 agent.py
 ```
 
+**Linux**
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve
+# En otra terminal:
+ollama pull llama3.2
+python3 agent.py
+```
+
+**Windows**
+
+1. Descarga el instalador desde [ollama.com/download](https://ollama.com/download) → **Windows**
+2. Ejecuta el `.exe` e instala normalmente
+3. Ollama inicia automáticamente como servicio en segundo plano
+4. Abre **PowerShell** o **CMD** y descarga un modelo:
+
+```powershell
+ollama pull llama3.2
+python agent.py
+```
+
+> No necesitas correr `ollama serve` manualmente en Windows — el instalador lo configura como servicio de Windows.
+
 Otros modelos compatibles: `mistral`, `phi3`, `gemma3`, `codellama`.
+
+---
 
 ### Claude Code
 
 Usa tu suscripción de claude.ai, sin créditos API separados. Requiere Claude Code CLI instalado y autenticado.
 
+**macOS / Linux**
 ```bash
-claude --version   # verificar instalación
-# BACKEND = "claude-code"
+npm install -g @anthropic-ai/claude-code
+claude --version
+claude   # inicia sesión la primera vez
 python3 agent.py
 ```
 
-Para que Claude Code no interrumpa con prompts de permiso, agrega tu carpeta en `~/.claude/settings.json`:
+**Windows**
+
+Requiere Node.js instalado ([nodejs.org](https://nodejs.org)). Luego en PowerShell:
+
+```powershell
+npm install -g @anthropic-ai/claude-code
+claude --version
+claude   # inicia sesión la primera vez
+python agent.py
+```
+
+> En Windows, si `claude` no se reconoce después de instalar, reinicia PowerShell o ejecuta `refreshenv` si tienes Chocolatey instalado.
+
+**Permisos para evitar interrupciones**
+
+Para que Claude Code no interrumpa con prompts de permiso, edita el archivo de configuración:
+
+macOS/Linux: `~/.claude/settings.json`  
+Windows: `%USERPROFILE%\.claude\settings.json`
 
 ```json
 {
   "permissions": {
     "allow": [
-      "Write(/ruta/absoluta/a/Agente_test/**)",
+      "Write(C:/ruta/absoluta/a/Agente_test/**)",
       "Bash(mkdir *)"
     ]
   }
 }
 ```
 
+> En Windows usa barras normales `/` o barras dobles `\\` en la ruta, no barras simples `\`.
+
 ---
 
 ## Comparación de backends
 
-| Backend | Costo | Tool use nativo | Streaming |
-|---|---|---|---|
-| `zhipu` | Gratis (con registro) | Sí | No |
-| `anthropic` | Créditos API | Sí | No |
-| `ollama` | Gratis (local) | Texto embebido | No |
-| `claude-code` | Suscripción claude.ai | Texto embebido | Sí |
+| Backend | Costo | Tool use nativo | Streaming | Windows |
+|---|---|---|---|---|
+| `zhipu` | Gratis (con registro) | Sí | No | ✅ |
+| `anthropic` | Créditos API | Sí | No | ✅ |
+| `ollama` | Gratis (local) | Texto embebido | No | ✅ |
+| `claude-code` | Suscripción claude.ai | Texto embebido | Sí | ✅ |
 
 ---
 
 ## Ejecutar
 
+**macOS / Linux**
 ```bash
+source env/bin/activate
 python3 agent.py
+```
+
+**Windows — PowerShell**
+```powershell
+env\Scripts\Activate.ps1
+python agent.py
+```
+
+**Windows — CMD**
+```cmd
+env\Scripts\activate.bat
+python agent.py
 ```
 
 Se abre una ventana de chat.
@@ -213,6 +408,8 @@ Antes de crear archivos, el agente pide una carpeta destino mediante un diálogo
 ```
 
 El agente la configura automáticamente si la ruta existe.
+
+> En Windows las rutas con espacios funcionan normalmente desde el diálogo gráfico. Si las escribes en el chat, usa comillas: `"C:/Users/tu_usuario/Proyectos/mi app"`.
 
 ### Ejemplos de uso por área
 
@@ -280,6 +477,7 @@ El agente escribe el código Python, lo registra y lo usa de inmediato. Persiste
 - **Pide confirmación explícita** antes de operaciones destructivas: "antes de borrar, muéstrame qué vas a eliminar"
 - **Usa `/compact`** si la conversación es muy larga y el modelo empieza a perder contexto
 - **Cambia de backend** en el dropdown superior sin reiniciar la app
+- **Windows**: si la ventana GUI no abre, verifica que tkinter esté instalado corriendo `python -m tkinter` — debe abrir una ventana de prueba pequeña
 
 ---
 
@@ -316,6 +514,20 @@ Procesando ·
 Procesando ··
 Procesando ···
 ```
+
+---
+
+## Solución de problemas comunes en Windows
+
+| Problema | Causa probable | Solución |
+|---|---|---|
+| `python3` no se reconoce | Windows usa `python` | Reemplaza `python3` por `python` en todos los comandos |
+| Error de permisos al activar venv | Política de ejecución de PowerShell | `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` |
+| La ventana GUI no abre | tkinter no instalado | Reinstala Python marcando "tcl/tk and IDLE" |
+| `.env` cargado como `.env.txt` | Bloc de notas agrega extensión | Guarda con tipo "Todos los archivos" o usa VS Code |
+| `claude` no reconocido tras instalación | PATH no actualizado | Reinicia PowerShell o abre CMD nuevo |
+| Ollama connection refused | Servicio no iniciado | Abre el menú inicio → busca Ollama → inícialo |
+| Ruta con espacios rompe el agente | Comillas faltantes | Usa rutas sin espacios o menciónalas entre comillas en el chat |
 
 ---
 

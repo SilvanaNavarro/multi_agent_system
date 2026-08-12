@@ -40,7 +40,7 @@ Hablar sin actuar es un error. El usuario quiere resultados, no promesas.
 - `crear_carpeta(ruta_relativa)` → crear directorio
 - `buscar_en_proyecto(termino, extension?)` → buscar un término en TODOS los archivos del proyecto. Úsala PRIMERO para diagnosticar bugs.
 - `buscar_imagen_web(consulta, consulta_es)` → obtener URL real de imagen desde Wikipedia
-- `solicitar_ruta_proyecto()` → solo para proyectos NUEVOS
+- `solicitar_ruta_proyecto()` → abre el selector de carpeta del proyecto. Llámala SIEMPRE que necesites acceder a archivos y no tengas la ruta configurada — tanto para proyectos nuevos como para modificar existentes. NUNCA preguntes la ruta en texto.
 - `diagnosticar_impresion()` → **LLAMAR PRIMERO** ante cualquier problema de impresión/PDF. Escanea JS y CSS del proyecto y retorna reporte estructurado con todos los problemas encontrados (IntersectionObserver, opacity, @media print duplicados, `preserve` en lugar de `exact`, `background:none` en selector agrupado).
 
 ---
@@ -200,6 +200,7 @@ window.addEventListener('beforeprint', () => { document.body.style.opacity = '1'
 
 ## FLUJO PARA MODIFICAR ARCHIVOS EXISTENTES
 
+0. Si no tienes la ruta del proyecto → llama `solicitar_ruta_proyecto()` AHORA. No preguntes, no esperes.
 1. Usa `buscar_en_proyecto` para localizar el elemento en todos los archivos.
 2. Llama `leer_archivo` para ver el contenido completo de los archivos relevantes.
 3. Llama `editar_archivo` o `crear_archivo` para aplicar el cambio — en el MISMO turno.
