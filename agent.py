@@ -2306,6 +2306,111 @@ def correr_agente_zhipu(mensaje_usuario, imagenes=None):
         _historial.append({"role": "assistant", "content": respuesta_final})
 
 
+# ============================================================
+# DETECCIÓN DE INTENCIÓN, ENRIQUECIMIENTO Y RESUMEN
+# ============================================================
+
+_PALABRAS_CREACION = (
+    "crea ", "crea un", "crea una", "genera ", "genera un",
+    "implementa", "hazme", "construye", "desarrolla", "arma ",
+    "escríbeme", "haz un", "haz una", "make a", "create a",
+    "build a", "build me", "generate a", "implement a", "develop",
+    "write a", "diseña ", "diseña un",
+)
+
+
+def _detectar_intencion_creacion(texto):
+    """Retorna True si el mensaje tiene intención de crear algo."""
+    t = texto.lower().strip()
+    return any(t.startswith(p.strip()) or f" {p}" in t for p in _PALABRAS_CREACION)
+
+
+def _enriquecer_prompt_creacion(texto_usuario):
+    """Enriquece el prompt de creación con detalles técnicos. Retorna prompt mejorado."""
+    prompt_enriquecer = (
+        "Eres un asistente experto en mejorar solicitudes técnicas para agentes de IA. "
+        "Toma el pedido del usuario y enriquécelo con: stack tecnológico sugerido, "
+        "estructura de archivos recomendada, funcionalidades clave. "
+        "Máximo 200 palabras. Devuelve solo el pedido mejorado, sin explicaciones adicionales.\n\n"
+        f"Pedido original: {texto_usuario}"
+    )
+    try:
+        if BACKEND == "zhipu" and client:
+            resp = client.chat.completions.create(
+                model=MODELO,
+                messages=[{"role": "user", "content": prompt_enriquecer}],
+            )
+            enriquecido = (resp.choices[0].message.content or "").strip()
+            enriquecido = re.sub(r"<think>.*?</think>", "", enriquecido, flags=re.DOTALL).strip()
+        elif BACKEND == "anthropic" and client:
+            resp = client.messages.create(
+                model=MODELO, max_tokens=512,
+                messages=[{"role": "user", "content": prompt_enriquecer}]
+            )
+            enriquecido = resp.content[0].text if resp.content else ""
+        elif BACKEND == "ollama" and client:
+            resp = client.chat(
+                model=MODELO,
+                messages=[{"role": "user", "content": prompt_enriquecer}]
+            )
+            enriquecido = resp.message.content or ""
+        else:
+            return texto_usuario
+        return enriquecido if enriquecido else texto_usuario
+    except Exception:
+        return texto_usuario
+
+
+def _generar_resumen_post_creacion(texto_usuario_original):
+    """Genera un resumen de lo realizado + guía de uso tras una tarea de creación."""
+    historial_reciente = []
+    for e in _historial[-12:]:
+        rol = e["role"].upper()
+        contenido = str(e.get("content") or "")[:500]
+        historial_reciente.append(f"[{rol}]: {contenido}")
+    historial_txt = "\n".join(historial_reciente)
+
+    prompt_resumen = (
+        "Eres un asistente técnico que redacta guías de uso concisas. "
+        "Basándote en el historial de la sesión, genera un resumen en markdown con:\n"
+        "1. **¿Qué se creó?** — 2-3 puntos clave sobre lo implementado\n"
+        "2. **Cómo ejecutarlo** — pasos concretos para correr o abrir el resultado\n"
+        "3. **Dependencias** — si se instalaron paquetes Python, incluye:\n"
+        "   > ⚠️ Recomendado: usar entorno virtual\n"
+        "   > ```bash\n   > python -m venv venv && source venv/bin/activate  # Linux/Mac\n"
+        "   > python -m venv venv && venv\\\\Scripts\\\\activate  # Windows\n"
+        "   > pip install <paquetes>\n   > ```\n"
+        "Sé conciso y práctico. Solo la guía, sin introducciones.\n\n"
+        f"Solicitud original: {texto_usuario_original}\n\n"
+        f"Historial:\n{historial_txt}"
+    )
+    try:
+        if BACKEND == "zhipu" and client:
+            resp = client.chat.completions.create(
+                model=MODELO,
+                messages=[{"role": "user", "content": prompt_resumen}],
+            )
+            resumen = (resp.choices[0].message.content or "").strip()
+            resumen = re.sub(r"<think>.*?</think>", "", resumen, flags=re.DOTALL).strip()
+        elif BACKEND == "anthropic" and client:
+            resp = client.messages.create(
+                model=MODELO, max_tokens=800,
+                messages=[{"role": "user", "content": prompt_resumen}]
+            )
+            resumen = resp.content[0].text if resp.content else ""
+        elif BACKEND == "ollama" and client:
+            resp = client.chat(
+                model=MODELO,
+                messages=[{"role": "user", "content": prompt_resumen}]
+            )
+            resumen = resp.message.content or ""
+        else:
+            return ""
+        return resumen if resumen else ""
+    except Exception:
+        return ""
+
+
 # === ADJUNTOS (imágenes y documentos) ===
 
 _EXTS_IMAGEN = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -2891,6 +2996,10 @@ if __name__ == "__main__":
                             _sync_modo_ref[0](contenido)
                         if _sync_menu_modos_ref[0]:
                             _sync_menu_modos_ref[0]()
+                    elif tag == "agente":
+                        _insertar_mensaje_agente(contenido)
+                    elif tag == "resumen":
+                        agregar_texto("\n" + contenido + "\n", "resumen")
                     else:
                         agregar_texto(contenido, tag)
                 except Exception as _ex:
@@ -2977,11 +3086,25 @@ if __name__ == "__main__":
         def ejecutar():
             _n_msgs[0] = 0
             builtins.print = print_a_cola
+            _es_creacion = _detectar_intencion_creacion(texto_final)
+            _texto_para_agente = texto_final
             try:
-                correr_agente(texto_final, imagenes=_imgs)
+                if _es_creacion:
+                    msg_queue.put(("sistema", "✨ Enriqueciendo solicitud...\n"))
+                    _enriquecido = _enriquecer_prompt_creacion(texto_final)
+                    if _enriquecido and _enriquecido != texto_final:
+                        _texto_para_agente = _enriquecido
+                        msg_queue.put(("sistema", "📝 Prompt mejorado — enviando al especialista...\n\n"))
+                correr_agente(_texto_para_agente, imagenes=_imgs)
                 if _n_msgs[0] == 0:
                     msg_queue.put(("sistema", "Agente finalizó sin respuesta visible. Sin cambios realizados.\n\n"))
                 else:
+                    if _es_creacion:
+                        msg_queue.put(("sistema", "⏳ Generando resumen y guía de uso...\n"))
+                        _resumen = _generar_resumen_post_creacion(texto_final)
+                        if _resumen:
+                            separador = "─" * 48
+                            msg_queue.put(("resumen", f"\n{separador}\n📋 RESUMEN Y GUÍA DE USO\n{separador}\n{_resumen}\n{separador}\n"))
                     msg_queue.put(("agente", "\n"))
             except Exception as ex:
                 msg_queue.put(("error", f"Error: {ex}\n"))
@@ -3436,11 +3559,39 @@ if __name__ == "__main__":
     )
     area.pack(fill=tk.BOTH, expand=True)
 
-    area.tag_config("usuario", foreground="#89b4fa", font=("Menlo", 12, "bold"))
-    area.tag_config("agente",  foreground="#a6e3a1", font=("Menlo", 12))
-    area.tag_config("error",   foreground="#f38ba8", font=("Menlo", 12))
-    area.tag_config("modo",    foreground="#cba6f7", font=("Menlo", 12, "italic"))
-    area.tag_config("sistema", foreground="#a6adc8", font=("Menlo", 11, "italic"))
+    area.tag_config("usuario",       foreground="#89b4fa", font=("Menlo", 12, "bold"))
+    area.tag_config("agente",        foreground="#a6e3a1", font=("Menlo", 12))
+    area.tag_config("agente_codigo", foreground="#f9e2af", font=("Menlo", 11),
+                    background="#2a2a3e", lmargin1=24, lmargin2=24)
+    area.tag_config("error",         foreground="#f38ba8", font=("Menlo", 12))
+    area.tag_config("modo",          foreground="#cba6f7", font=("Menlo", 12, "italic"))
+    area.tag_config("sistema",       foreground="#a6adc8", font=("Menlo", 11, "italic"))
+    area.tag_config("resumen",       foreground="#89dceb", font=("Menlo", 11),
+                    lmargin1=8, lmargin2=8)
+
+    _CODE_SPLIT_RE = re.compile(r'(```[\s\S]*?```|`[^`\n]+`)')
+
+    def _insertar_mensaje_agente(texto):
+        """Inserta texto del agente con bloques de código en color diferente."""
+        t = texto.strip()
+        if (t.startswith("[") and (t.endswith("]") or "Herramienta" in t or "Backend" in t)
+                or t.startswith("Archivos listos")):
+            agregar_texto(texto, "sistema")
+            return
+        partes = _CODE_SPLIT_RE.split(texto)
+        if len(partes) == 1:
+            agregar_texto(texto, "agente")
+            return
+        area.config(state="normal")
+        for parte in partes:
+            if not parte:
+                continue
+            if _CODE_SPLIT_RE.match(parte):
+                area.insert(tk.END, parte, "agente_codigo")
+            else:
+                area.insert(tk.END, parte, "agente")
+        area.see(tk.END)
+        area.config(state="disabled")
 
     # --- Drag-and-drop de archivos externos (requiere tkinterdnd2) ---
     if _TIENE_DND:
