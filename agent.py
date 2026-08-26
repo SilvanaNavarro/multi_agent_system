@@ -178,12 +178,15 @@ def construir_system_prompt(modo):
         "¿cómo puedes ayudarme?, ¿qué puedes hacer?\n"
         "→ Responde con texto. NO llames herramientas. NO crees archivos.\n\n"
         "EJECUCIÓN — señales claras: crea, genera, implementa, configura, arma, escribe, hazme, "
-        "empieza ya.\n"
-        "⚠️  'quiero X', 'necesito X', 'quisiera X' SIN imperativo directo = AMBIGUO, no EJECUCIÓN.\n"
+        "empieza ya — Y el objeto de la acción está claramente definido.\n"
         "→ Usa herramientas y crea archivos según corresponda.\n\n"
-        "AMBIGUO — el enunciado mezcla intención de hacer algo con una pregunta, o usa 'quiero/necesito'.\n"
-        "→ Haz UNA pregunta de aclaración antes de ejecutar cualquier herramienta.\n"
-        "   Ejemplo: '¿Quieres que empiece ahora o prefieres que te explique primero cómo puedo ayudarte?'\n\n"
+        "AMBIGUO con dos subcasos:\n"
+        "  • SESIÓN DE TRABAJO: 'quiero modificar', 'quiero trabajar en', 'ayúdame con mi proyecto' "
+        "→ activa el experto técnico con cambiar_modo(). El experto carga el contexto del proyecto "
+        "y pregunta qué cambiar.\n"
+        "  • PROBLEMA SIN DESCRIBIR: 'corrige', 'arregla', 'soluciona', 'no funciona' "
+        "SIN decir qué está mal → haz UNA pregunta de aclaración antes de cambiar de modo o leer archivos. "
+        "Ejemplo: '¿Qué problema tiene? ¿Un error, algo que no se ve, algo que no responde?'\n\n"
         "⛔ NUNCA pidas la ruta del proyecto en texto. Si necesitas acceder a archivos, es señal de que\n"
         "   debes cambiar al experto técnico con cambiar_modo() — el experto llama solicitar_ruta_proyecto()."
     )
@@ -320,6 +323,7 @@ if _error_inicializacion:
 HERRAMIENTAS_DINAMICAS = {}
 CUSTOM_TOOLS_FILE = "custom_tools.json"
 TOOLS_DESACTIVADAS: set = set()  # nombres de herramientas desactivadas desde la GUI
+_ARCHIVOS_LEIDOS: set = set()  # rutas absolutas leídas en esta sesión (enforcement Read→Edit)
 
 TOOLS = [
     {
@@ -640,6 +644,29 @@ TOOLS = [
             },
             "required": ["paquete"]
         }
+    },
+    {
+        "name": "ejecutar_comando",
+        "description": (
+            "Ejecuta un comando de terminal en el directorio del proyecto. "
+            "Pide confirmación al usuario antes de ejecutar. "
+            "Úsala para: instalar dependencias, correr tests, compilar, verificar sintaxis, "
+            "ejecutar scripts. NO uses para operaciones destructivas sin advertencia explícita."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "comando": {
+                    "type": "string",
+                    "description": "Comando a ejecutar, ej: 'npm install', 'python -m pytest', 'node index.js'"
+                },
+                "motivo": {
+                    "type": "string",
+                    "description": "Por qué necesitas ejecutarlo, ej: 'instalar dependencias del proyecto'"
+                }
+            },
+            "required": ["comando"]
+        }
     }
 ]
 
@@ -849,6 +876,14 @@ def _despachar_herramienta(nombre, inputs):
         SYSTEM_PROMPT = construir_system_prompt(modo)
         MODO_ACTUAL = modo
         print(f"__MODO__{modo}")
+        _historial.append({
+            "role": "user",
+            "content": f"[SISTEMA: modo cambiado a '{modo}' — {MODOS_ETIQUETAS[modo]}]"
+        })
+        _historial.append({
+            "role": "assistant",
+            "content": f"Modo activo: {MODOS_ETIQUETAS[modo]}. Continúo."
+        })
         return f"Modo cambiado a '{MODOS_ETIQUETAS[modo]}'."
 
     if nombre == "crear_agente":
@@ -987,13 +1022,14 @@ def _despachar_herramienta(nombre, inputs):
         if err:
             return err
         if _solicitar_confirmacion[0]:
-            contenido_preview = inputs.get("contenido", "")[:300].replace("\n", "↵")
-            n_chars = len(inputs.get("contenido", ""))
+            n_chars  = len(inputs.get("contenido", ""))
+            n_lineas = inputs.get("contenido", "").count("\n") + 1
+            preview  = "\n".join(inputs.get("contenido", "").splitlines()[:15])
             pregunta = (
                 f"El agente quiere CREAR el archivo '{inputs['ruta_relativa']}' "
-                f"({n_chars} caracteres).\n\n"
-                f"Vista previa:\n{contenido_preview}"
-                f"{'…' if n_chars > 300 else ''}"
+                f"({n_lineas} líneas / {n_chars} chars).\n\n"
+                f"Primeras 15 líneas:\n{preview}"
+                + ("\n[...]" if n_lineas > 15 else "")
             )
             aprobado = _solicitar_confirmacion[0](pregunta)
             if not aprobado:
@@ -1037,6 +1073,7 @@ def _despachar_herramienta(nombre, inputs):
                         f"[PDF SIN TEXTO] '{inputs.get('ruta_relativa')}' no tiene texto extraíble "
                         f"(puede ser imagen escaneada o PDF protegido)."
                     )
+                _ARCHIVOS_LEIDOS.add(ruta_abs)
                 return texto
             except ImportError:
                 return (
@@ -1115,6 +1152,7 @@ def _despachar_herramienta(nombre, inputs):
             except Exception as e:
                 return f"Error al leer .docx '{ruta_abs}': {type(e).__name__}: {e}"
         # --- Lectura normal de texto plano ---
+        _ARCHIVOS_LEIDOS.add(ruta_abs)
         try:
             with open(ruta_abs, "r", encoding="utf-8") as f:
                 contenido = f.read()
@@ -1150,6 +1188,12 @@ def _despachar_herramienta(nombre, inputs):
                 contenido = f.read()
         except OSError as e:
             return f"Error al leer '{ruta_abs}': {type(e).__name__}: {e}"
+        if ruta_abs not in _ARCHIVOS_LEIDOS:
+            return (
+                f"Error: debes llamar leer_archivo('{inputs['ruta_relativa']}') "
+                f"antes de editar. Nunca escribas texto_original de memoria — "
+                f"copia el texto exacto del archivo leído."
+            )
         texto_original = inputs["texto_original"]
         texto_nuevo = inputs["texto_nuevo"]
         if texto_original == texto_nuevo:
@@ -1184,6 +1228,12 @@ def _despachar_herramienta(nombre, inputs):
                     f"  Inicio del archivo: {preview}\n"
                     f"  → Llama leer_archivo('{inputs['ruta_relativa']}') para ver el contenido exacto y copiar el texto a editar."
                 )
+        ocurrencias = contenido.count(texto_original)
+        if ocurrencias > 1:
+            return (
+                f"Error: texto_original aparece {ocurrencias} veces en '{inputs['ruta_relativa']}'. "
+                f"Amplía el contexto incluyendo líneas antes/después para que sea único."
+            )
         nuevo_contenido = contenido.replace(texto_original, texto_nuevo, 1)
         if nuevo_contenido == contenido:
             return (
@@ -1196,6 +1246,8 @@ def _despachar_herramienta(nombre, inputs):
                 f.write(nuevo_contenido)
         except OSError as e:
             return f"Error al escribir '{ruta_abs}': {type(e).__name__}: {e}"
+        # Invalidar caché de lectura — el archivo cambió, próximo edit exige nuevo leer_archivo
+        _ARCHIVOS_LEIDOS.discard(ruta_abs)
         return f"Archivo editado: {inputs['ruta_relativa']} — reemplazo aplicado."
 
     if nombre == "buscar_imagen_web":
@@ -1498,6 +1550,35 @@ def _despachar_herramienta(nombre, inputs):
             return f"Timeout (120 s) al instalar '{paquete}'. El usuario puede intentarlo manualmente."
         except Exception as e:
             return f"Error inesperado al instalar '{paquete}': {type(e).__name__}: {e}"
+
+    if nombre == "ejecutar_comando":
+        import subprocess as _sp, sys as _sys
+        comando = inputs.get("comando", "").strip()
+        motivo  = inputs.get("motivo", "").strip()
+        if not comando:
+            return "Se requiere el parámetro 'comando'."
+        pregunta = (
+            f"El agente quiere ejecutar en terminal:\n\n  {comando}\n"
+            + (f"\nMotivo: {motivo}" if motivo else "")
+            + "\n\n¿Autorizar ejecución?"
+        )
+        if _solicitar_confirmacion[0]:
+            if not _solicitar_confirmacion[0](pregunta):
+                return f"El usuario rechazó ejecutar '{comando}'. No se realizó ninguna acción."
+        cwd = RUTA_PROYECTO[0] if RUTA_PROYECTO[0] and os.path.isdir(RUTA_PROYECTO[0]) else AGENT_DIR
+        try:
+            result = _sp.run(
+                comando, shell=True, capture_output=True, text=True, timeout=120, cwd=cwd
+            )
+            salida  = (result.stdout or "").strip()
+            errores = (result.stderr or "").strip()
+            if result.returncode == 0:
+                return f"OK (código 0):\n{salida}" if salida else "Comando ejecutado sin salida."
+            return f"Error (código {result.returncode}):\n{errores or salida}"
+        except _sp.TimeoutExpired:
+            return f"Timeout (120 s) ejecutando '{comando}'. El proceso fue terminado."
+        except Exception as e:
+            return f"Error inesperado ejecutando '{comando}': {type(e).__name__}: {e}"
 
     if nombre in HERRAMIENTAS_DINAMICAS:
         try:
@@ -1813,6 +1894,7 @@ def compactar_historial():
     )
 
     _historial.clear()
+    _ARCHIVOS_LEIDOS.clear()
     _historial.append({"role": "user", "content": contexto_compactado})
     _historial.append({"role": "assistant", "content": "Contexto cargado. Continúo desde donde estábamos."})
 
@@ -2042,6 +2124,12 @@ def _tools_a_openai():
 
 _ZHIPU_ACTION_SUFFIX = (
     "\n\n## REGLA CRÍTICA DE EJECUCIÓN\n"
+    "REGLA 1 — DOS CASOS antes de actuar: "
+    "(A) Usuario quiere abrir sesión de trabajo ('quiero modificar', 'quiero trabajar en', 'ayúdame con') "
+    "→ carga el contexto: pide ruta, lista archivos, lee los relevantes, explica qué hay, pregunta qué cambiar. "
+    "(B) Usuario reporta problema sin describirlo ('corrige', 'arregla', 'soluciona', 'no funciona') "
+    "→ haz UNA pregunta de aclaración ANTES de leer cualquier archivo. "
+    "Leer archivos sin saber qué buscar cuando hay un bug reportado es alucinación anticipada — prohibido.\n"
     "Debes usar tool calls para realizar acciones. "
     "NUNCA describas lo que vas a hacer sin hacerlo — "
     "si necesitas editar un archivo, llama editar_archivo AHORA. "
@@ -2051,7 +2139,13 @@ _ZHIPU_ACTION_SUFFIX = (
     "NUNCA le preguntes la ruta al usuario por texto. "
     "El selector de carpeta se abrirá automáticamente.\n"
     "REGLA DE EDICIÓN: SIEMPRE llama leer_archivo ANTES de editar_archivo. "
-    "Nunca escribas texto_original de memoria — copia el texto exacto del archivo leído.\n"
+    "Nunca escribas texto_original de memoria — copia el texto exacto del archivo leído. "
+    "DESPUÉS de cada editar_archivo, el archivo queda invalidado: si necesitas editar el mismo archivo "
+    "otra vez, llama leer_archivo nuevamente antes — de lo contrario el sistema bloqueará el edit.\n"
+    "REGLA 3+ CAMBIOS: Si necesitas 3 o más modificaciones en el mismo archivo, usa crear_archivo "
+    "con el contenido completo reescrito — NO hagas N llamadas a editar_archivo.\n"
+    "REGLA ejecutar_comando: Para ejecutar comandos de terminal (npm, pip, docker, kubectl, tests), "
+    "usa ejecutar_comando(comando, motivo) — el sistema pedirá confirmación al usuario.\n"
     "REGLA PDF/IMPRESIÓN: Si el usuario menciona PDF, impresión, colores en PDF, "
     "header blanco, fondo que desaparece: llama diagnosticar_impresion() PRIMERO. "
     "NUNCA busques en script.js el botón de descarga — el bug está en CSS @media print, no en JS de restauración."
