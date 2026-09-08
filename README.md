@@ -128,6 +128,13 @@ pip install pdfplumber python-docx openpyxl
 # Pegar capturas de pantalla con Ctrl+V
 pip install Pillow
 
+# OCR para imágenes cuando se usa el backend Zhipu/GLM
+pip install pytesseract
+# También requiere tesseract en el sistema:
+#   macOS:   brew install tesseract
+#   Ubuntu:  sudo apt install tesseract-ocr
+#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
+
 # Drag-and-drop de archivos desde el explorador (opcional)
 pip install tkinterdnd2
 ```
@@ -137,12 +144,12 @@ pip install tkinterdnd2
 **Verificar instalación:**
 
 ```bash
-python3 -c "import dotenv, anthropic, pdfplumber, docx, openpyxl, PIL; print('OK')"
+python3 -c "import dotenv, anthropic, pdfplumber, docx, openpyxl, PIL, pytesseract; print('OK')"
 ```
 
 En Windows:
 ```powershell
-python -c "import dotenv, anthropic, pdfplumber, docx, openpyxl, PIL; print('OK')"
+python -c "import dotenv, anthropic, pdfplumber, docx, openpyxl, PIL, pytesseract; print('OK')"
 ```
 
 ### 4. Configurar API key
@@ -488,6 +495,19 @@ El agente escribe el código Python, lo registra y lo usa de inmediato. Persiste
 - `Enter` envía el mensaje
 - Barra de desplazamiento vertical si el mensaje es largo
 
+### Adjuntos
+
+Puedes adjuntar archivos e imágenes al mensaje:
+
+| Método | Cómo |
+|---|---|
+| **Botón 📎** | Abre selector de archivos |
+| **Ctrl+V / Cmd+V** | Pega imagen desde el portapapeles (capturas de pantalla) |
+| **Drag & Drop** | Arrastra un archivo desde el explorador (requiere `tkinterdnd2`) |
+
+Tipos soportados: PDF, Word (.docx), Excel (.xlsx), imágenes (PNG/JPG/GIF/WebP), texto plano.  
+Los adjuntos aparecen como chips sobre el campo de texto. Haz clic en ✕ para eliminarlos antes de enviar.
+
 ### Botones
 
 | Botón | Función |
@@ -503,17 +523,33 @@ El agente escribe el código Python, lo registra y lo usa de inmediato. Persiste
 | Azul | Tu mensaje |
 | Verde | Respuesta del agente |
 | Morado cursiva | Cambio de modo/experto |
+| Gris cursiva dim | Burbuja de actividad (acción actual + última completada) |
 | Gris cursiva | Mensajes del sistema / resultado de herramientas |
 | Rojo | Error |
 
 ### Indicador de procesamiento
 
-Mientras el agente trabaja, aparece bajo el área de chat:
+Mientras el agente trabaja se muestra una **burbuja de actividad** al final del chat, actualizada en tiempo real:
+
 ```
-Procesando ·
-Procesando ··
-Procesando ···
+  ✓ Editado: styles.css
+  Consultando IA...  ⠋
 ```
+
+- La línea superior (con ✓) es la última acción completada
+- La línea inferior es la acción en curso, con spinner animado
+- La burbuja desaparece cuando el agente entrega su respuesta final
+
+Secuencia típica:
+```
+  Consultando IA...  ⠙         ← LLM procesando (puede tardar 15-60s)
+  ✓ Consultando IA...
+  Editando archivo...  ⠼       ← herramienta en ejecución
+  ✓ Editado: index.html
+  Consultando IA...  ⠇         ← siguiente iteración
+```
+
+La barra inferior también muestra `Procesando ⠏` mientras el agente está activo.
 
 ---
 

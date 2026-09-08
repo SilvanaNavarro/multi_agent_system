@@ -12,9 +12,15 @@ pdfplumber>=0.11.0            # PDF → texto          → pip install pdfplumbe
 python-docx>=1.1.0            # DOCX → texto         → pip install python-docx
 openpyxl>=3.1.0               # XLSX/XLS → texto     → pip install openpyxl
 
-# ── Imágenes y portapapeles ───────────────────────────────────
+# ── Imágenes, OCR y portapapeles ─────────────────────────────
 Pillow>=10.0.0                # Ctrl+V capturas de pantalla (ImageGrab)
                               #                       → pip install Pillow
+pytesseract>=0.3.10           # OCR para imágenes en backend Zhipu
+                              #                       → pip install pytesseract
+                              # Requiere tesseract instalado en el sistema:
+                              #   macOS:   brew install tesseract
+                              #   Ubuntu:  sudo apt install tesseract-ocr
+                              #   Windows: https://github.com/UB-Mannheim/tesseract/wiki
 
 # ── Drag-and-drop desde el explorador (opcional) ─────────────
 # tkinterdnd2>=0.3.0          # Arrastrar archivos al chat

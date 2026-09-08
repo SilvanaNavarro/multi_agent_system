@@ -324,6 +324,7 @@ HERRAMIENTAS_DINAMICAS = {}
 CUSTOM_TOOLS_FILE = "custom_tools.json"
 TOOLS_DESACTIVADAS: set = set()  # nombres de herramientas desactivadas desde la GUI
 _ARCHIVOS_LEIDOS: set = set()  # rutas absolutas leídas en esta sesión (enforcement Read→Edit)
+_CACHE_ARCHIVOS: dict = {}     # ruta_rel -> contenido; persiste entre turnos para evitar re-lecturas
 
 TOOLS = [
     {
@@ -825,10 +826,14 @@ def _log_tool(nombre, inputs, result):
 
 
 def ejecutar_herramienta(nombre, inputs):
+    import time as _time
     global SYSTEM_PROMPT, MODO_ACTUAL
+    _t_tool = _time.perf_counter()
     try:
         result = _despachar_herramienta(nombre, inputs)
+        _elapsed_tool = _time.perf_counter() - _t_tool
         _log_tool(nombre, inputs, result)
+        print(f"[⏱ {nombre}: {_elapsed_tool:.2f}s]")
         return result
     except KeyError as exc:
         msg = (
@@ -937,10 +942,21 @@ def _despachar_herramienta(nombre, inputs):
         pregunta = inputs.get("pregunta", "¿Confirmas esta acción?")
         if _solicitar_confirmacion[0]:
             aprobado = _solicitar_confirmacion[0](pregunta)
-            return "El usuario aprobó. Procede." if aprobado else "El usuario rechazó. No realices la acción."
+            return (
+                "APROBADO. Ejecuta AHORA TODOS los cambios planificados en una sola respuesta completa. "
+                "No pidas más confirmaciones. Edita todos los archivos necesarios de una vez."
+                if aprobado else
+                "El usuario rechazó. No realices la acción."
+            )
         return "Confirmación no disponible. Procede."
 
     if nombre == "solicitar_ruta_proyecto":
+        # Si ya hay ruta en esta sesión, no abrir selector de nuevo
+        if RUTA_PROYECTO[0] and os.path.isdir(RUTA_PROYECTO[0]):
+            return (
+                f"Ruta ya configurada en esta sesión: {RUTA_PROYECTO[0]}\n"
+                f"Usa ruta_relativa relativa a esa carpeta. No necesitas volver a pedirla."
+            )
         ruta_sugerida = inputs.get("ruta_sugerida", "").strip()
         if ruta_sugerida:
             if os.path.isabs(ruta_sugerida):
@@ -964,6 +980,7 @@ def _despachar_herramienta(nombre, inputs):
                                 f"Continúa usando la ruta actual: {RUTA_PROYECTO[0]}"
                             )
                 RUTA_PROYECTO[0] = ruta_resuelta
+                _poblar_cache_proyecto(ruta_resuelta)
                 if _notificar_ruta_proyecto[0]:
                     _notificar_ruta_proyecto[0](ruta_resuelta)
                 return (
@@ -1038,6 +1055,8 @@ def _despachar_herramienta(nombre, inputs):
             os.makedirs(os.path.dirname(ruta_abs) or RUTA_PROYECTO[0], exist_ok=True)
             with open(ruta_abs, "w", encoding="utf-8") as f:
                 f.write(inputs["contenido"])
+            _CACHE_ARCHIVOS[ruta_abs] = inputs["contenido"]
+            _ARCHIVOS_LEIDOS.add(ruta_abs)
         except OSError as e:
             return (
                 f"Error al escribir '{ruta_abs}'.\n"
@@ -1153,15 +1172,21 @@ def _despachar_herramienta(nombre, inputs):
                 return f"Error al leer .docx '{ruta_abs}': {type(e).__name__}: {e}"
         # --- Lectura normal de texto plano ---
         _ARCHIVOS_LEIDOS.add(ruta_abs)
+        _ruta_rel_cache = inputs.get("ruta_relativa", "")
+        # Devolver desde cache si ya está cargado y no fue invalidado
+        if ruta_abs in _CACHE_ARCHIVOS:
+            print(f"[cache hit: {_ruta_rel_cache}]")
+            return _CACHE_ARCHIVOS[ruta_abs]
         try:
             with open(ruta_abs, "r", encoding="utf-8") as f:
                 contenido = f.read()
             if not contenido.strip():
                 return (
-                    f"[ARCHIVO VACÍO] '{inputs.get('ruta_relativa')}' existe pero tiene 0 bytes de contenido.\n"
+                    f"[ARCHIVO VACÍO] '{_ruta_rel_cache}' existe pero tiene 0 bytes de contenido.\n"
                     f"  Causa probable: el archivo fue creado pero nunca se escribió contenido en él.\n"
                     f"  Acción: verifica cómo fue creado el archivo o pide al usuario que lo rellene."
                 )
+            _CACHE_ARCHIVOS[ruta_abs] = contenido
             return contenido
         except UnicodeDecodeError:
             return (
@@ -1246,8 +1271,9 @@ def _despachar_herramienta(nombre, inputs):
                 f.write(nuevo_contenido)
         except OSError as e:
             return f"Error al escribir '{ruta_abs}': {type(e).__name__}: {e}"
-        # Invalidar caché de lectura — el archivo cambió, próximo edit exige nuevo leer_archivo
-        _ARCHIVOS_LEIDOS.discard(ruta_abs)
+        # Actualizar cache con el contenido nuevo — siguiente edit NO requiere re-leer
+        _CACHE_ARCHIVOS[ruta_abs] = nuevo_contenido
+        _ARCHIVOS_LEIDOS.add(ruta_abs)
         return f"Archivo editado: {inputs['ruta_relativa']} — reemplazo aplicado."
 
     if nombre == "buscar_imagen_web":
@@ -1795,7 +1821,7 @@ def correr_agente_ollama(mensaje_usuario, imagenes=None):
     messages = [{"role": "system", "content": system_con_tools}]
     messages += [{"role": e["role"], "content": e["content"]} for e in _historial]
 
-    MAX_ITER = 10
+    MAX_ITER = 18
     respuesta_final = ""
     for _ in range(MAX_ITER):
         if _detener_agente.is_set():
@@ -1917,7 +1943,7 @@ def correr_agente_claude_code(mensaje_usuario, imagenes=None):
     mensajes = [{"role": e["role"], "content": e["content"]} for e in _historial]
     _respuesta_asistente = ""
 
-    MAX_ITER = 10
+    MAX_ITER = 18
     _reintentos_meta = 0
     for _ in range(MAX_ITER):
         # Mantener últimas 12 entradas del historial para no superar el límite de contexto
@@ -2124,6 +2150,15 @@ def _tools_a_openai():
 
 _ZHIPU_ACTION_SUFFIX = (
     "\n\n## REGLA CRÍTICA DE EJECUCIÓN\n"
+    "REGLA 0 — LECTURA EN BATCH:\n"
+    "Si necesitas leer MÚLTIPLES archivos, llama leer_archivo para TODOS ellos en una SOLA respuesta — "
+    "nunca leas un archivo por respuesta. El sistema procesará todas las llamadas en paralelo.\n\n"
+    "REGLA 0b — PLAN ANTES DE EJECUTAR:\n"
+    "Antes de usar herramientas, escribe en texto:\n"
+    "  1. Qué vas a hacer (2-4 líneas máximo).\n"
+    "  2. Llama pedir_confirmacion() con ese plan resumido.\n"
+    "  3. Solo si el usuario aprueba, ejecuta TODAS las herramientas necesarias en esa misma respuesta.\n"
+    "  EXCEPCIÓN: si la acción es de solo lectura (leer_archivo, listar_archivos, buscar_*) NO pidas confirmación — ejecuta directo.\n\n"
     "REGLA 1 — DOS CASOS antes de actuar: "
     "(A) Usuario quiere abrir sesión de trabajo ('quiero modificar', 'quiero trabajar en', 'ayúdame con') "
     "→ carga el contexto: pide ruta, lista archivos, lee los relevantes, explica qué hay, pregunta qué cambiar. "
@@ -2161,30 +2196,71 @@ def correr_agente_zhipu(mensaje_usuario, imagenes=None):
             "  Ejecuta: export ZAI_API_KEY=tu_clave  y  pip install zai-sdk"
         )
         return
+    if imagenes:
+        print("🔍 Zhipu no soporta visión — aplicando OCR a las imágenes...")
+        texto_ocr = _ocr_imagenes(imagenes)
+        mensaje_usuario = f"{mensaje_usuario}\n\n{texto_ocr}"
+        imagenes = None
     _historial.append({"role": "user", "content": mensaje_usuario})
     messages = [{"role": "system", "content": SYSTEM_PROMPT + _ZHIPU_ACTION_SUFFIX}]
     messages += [{"role": e["role"], "content": e["content"]} for e in _historial
                  if e["role"] in ("user", "assistant")]
-    if imagenes:
-        messages[-1]["content"] = _content_openai(mensaje_usuario, imagenes)
+
+    # Inyectar archivos en cache como contexto sintético — evita leer_archivo y listar_archivos
+    if _CACHE_ARCHIVOS and RUTA_PROYECTO[0]:
+        _base_cache = os.path.abspath(RUTA_PROYECTO[0])
+        _lineas_cache = []
+        _nombres_cache = []
+        for _ruta_abs_c, _cont_c in _CACHE_ARCHIVOS.items():
+            try:
+                _rel_c = os.path.relpath(_ruta_abs_c, _base_cache)
+            except ValueError:
+                _rel_c = _ruta_abs_c
+            _nombres_cache.append(_rel_c)
+            # Truncar a 3000 chars por archivo para mantener contexto compacto
+            _lineas_cache.append(f"--- {_rel_c} ---\n{_cont_c[:3000]}")
+        if _lineas_cache:
+            _lista_nombres = ", ".join(_nombres_cache)
+            _cache_bloque = "\n\n".join(_lineas_cache)
+            messages.insert(1, {
+                "role": "user",
+                "content": (
+                    f"[PROYECTO EN CONTEXTO: {_lista_nombres}]\n"
+                    f"PROHIBIDO usar leer_archivo o listar_archivos — los archivos ya están completos abajo. "
+                    f"Usarlos desperdicia iteraciones y es un error. Lee directamente de aquí:\n\n"
+                    + _cache_bloque
+                )
+            })
+            messages.insert(2, {
+                "role": "assistant",
+                "content": (
+                    f"Proyecto cargado. Tengo en memoria: {_lista_nombres}. "
+                    "No llamaré listar_archivos ni leer_archivo — tengo todo el contenido aquí y lo usaré directamente."
+                )
+            })
 
     import zai as _zai
-    MAX_ITER = 10
+    MAX_ITER = 18
     respuesta_final = ""
     tools_openai = _tools_a_openai()
     tool_log = []
     _ya_compacto = False
 
-    for _ in range(MAX_ITER):
+    for _iter in range(MAX_ITER):
         if _detener_agente.is_set():
             break
         try:
+            import time as _time
+            print(f"[Pensando #{_iter + 1}...]")
+            _t_llm = _time.perf_counter()
             response = client.chat.completions.create(
                 model=MODELO,
                 messages=messages,
                 tools=tools_openai,
                 tool_choice="auto",
             )
+            _elapsed_llm = _time.perf_counter() - _t_llm
+            print(f"[⏱ LLM #{_iter + 1}: {_elapsed_llm:.2f}s]")
         except _zai.core.APIStatusError as e:
             print(f"Error API zhipu ({e.status_code}): {e}")
             break
@@ -2269,10 +2345,15 @@ def correr_agente_zhipu(mensaje_usuario, imagenes=None):
                 inputs_tc = {}
             if _detener_agente.is_set():
                 break
+            # Herramientas cuyo resultado es coordinación interna — no mostrar en chat
+            _SILENCIOSAS = {"solicitar_ruta_proyecto", "pedir_confirmacion", "cambiar_modo",
+                            "agregar_conocimiento", "buscar_conocimiento"}
             print(f"[Herramienta: {nombre}]")
             resultado = ejecutar_herramienta(nombre, inputs_tc)
             resultado_str = str(resultado)
-            if nombre == "leer_archivo":
+            if nombre in _SILENCIOSAS:
+                tool_log.append(f"{nombre} → (silencioso)")
+            elif nombre == "leer_archivo":
                 print(f"[→ {inputs_tc.get('ruta_relativa', '?')}]")
                 tool_log.append(f"{nombre}({inputs_tc.get('ruta_relativa', '?')}) → [{len(resultado_str)} chars leídos]")
             else:
@@ -2289,108 +2370,30 @@ def correr_agente_zhipu(mensaje_usuario, imagenes=None):
         if MODO_ACTUAL != _modo_antes:
             messages[0] = {"role": "system", "content": SYSTEM_PROMPT + _ZHIPU_ACTION_SUFFIX}
 
-    # Si el modelo usó herramientas pero no dio respuesta final, verificar completitud.
-    # Si falta trabajo, pedir confirmación al usuario para continuar (otro batch de MAX_ITER).
-    MAX_CONTINUACIONES = 3
-    _continuaciones = 0
-    while tool_log and not respuesta_final and not _detener_agente.is_set():
-        if _continuaciones >= MAX_CONTINUACIONES:
-            respuesta_final = (
-                f"Tarea finalizada automáticamente tras {MAX_CONTINUACIONES} ciclos de continuación. "
-                "Si falta trabajo, describe la siguiente acción al agente."
-            )
-            print("\nAgente:", respuesta_final)
-            break
-        _continuaciones += 1
-
-        messages.append({
-            "role": "user",
-            "content": (
-                "¿Completaste COMPLETAMENTE la solicitud original del usuario? "
-                "Responde SOLO con una de estas dos formas:\n"
-                "- 'COMPLETO: [resumen breve de lo que se hizo]'\n"
-                "- 'PENDIENTE: [descripción específica de lo que falta por hacer]'"
-            ),
-        })
+    # Si el loop agotó iteraciones con tool calls pero sin texto final → generar resumen
+    if not respuesta_final and tool_log and not _detener_agente.is_set():
         try:
-            _rc_check = client.chat.completions.create(model=MODELO, messages=messages)
-            _check = (_rc_check.choices[0].message.content or "").strip()
-            _check = re.sub(r"<think>.*?</think>", "", _check, flags=re.DOTALL).strip()
-        except Exception as e:
-            print(f"Error verificando completitud: {e}")
-            break
-
-        messages.append({"role": "assistant", "content": _check})
-
-        if "PENDIENTE" not in _check.upper():
-            # Tarea completa — mostrar resumen al usuario
-            respuesta_final = _check
-            print("\nAgente:", respuesta_final)
-            break
-
-        # Hay trabajo pendiente — pedir confirmación al usuario antes de continuar
-        descripcion_falta = _check[_check.find(":") + 1:].strip() if ":" in _check else _check
-        if _solicitar_confirmacion[0]:
-            continuar = _solicitar_confirmacion[0](
-                f"El agente no terminó la tarea (ciclo {_continuaciones}/{MAX_CONTINUACIONES}).\n\nFalta:\n{descripcion_falta}\n\n¿Quieres que continúe trabajando?"
-            )
-        else:
-            continuar = False
-
-        if not continuar:
-            _detener_agente.set()
-            respuesta_final = f"Tarea cancelada por el usuario.\n\nPendiente:\n{descripcion_falta}"
-            print("\nAgente:", respuesta_final)
-            break
-
-        # Usuario confirmó continuar — otro ciclo de MAX_ITER herramientas
-        messages.append({
-            "role": "user",
-            "content": "Continúa. Usa las herramientas necesarias para completar la tarea. No te detengas hasta terminar.",
-        })
-        for _ in range(MAX_ITER):
-            if _detener_agente.is_set():
-                break
-            try:
-                _rc2 = client.chat.completions.create(
-                    model=MODELO, messages=messages, tools=tools_openai, tool_choice="auto",
+            print("[Generando resumen de acciones...]")
+            _msgs_resumen = messages + [{
+                "role": "user",
+                "content": (
+                    "Resume brevemente (2-4 oraciones) qué cambios realizaste y si quedó alguna tarea pendiente. "
+                    "Solo el resumen, sin preguntas."
                 )
-            except Exception as e:
-                print(f"Error continuación: {e}")
-                break
-            _mc2 = _rc2.choices[0].message
-            _tc2 = getattr(_mc2, "tool_calls", None) or []
-            if not _tc2:
-                _text2 = re.sub(r"<think>.*?</think>", "", (_mc2.content or ""), flags=re.DOTALL).strip()
-                if _text2:
-                    respuesta_final = _text2
-                    print("\nAgente:", respuesta_final)
-                break
-            messages.append({"role": "assistant", "content": _mc2.content or "", "tool_calls": [
-                {"id": _tc.id, "type": "function",
-                 "function": {"name": re.sub(r'[^\w]', '', re.split(r'[(\s<]', _tc.function.name or "")[0]),
-                              "arguments": _tc.function.arguments}}
-                for _tc in _tc2
-            ]})
-            _modo_cont = MODO_ACTUAL
-            for _tc in _tc2:
-                _n = re.sub(r'[^\w]', '', re.split(r'[(\s<]', (_tc.function.name or ""))[0])
-                try:
-                    _inp = json.loads((_tc.function.arguments or "").strip() or "{}")
-                except Exception:
-                    _inp = {}
-                if _detener_agente.is_set():
-                    break
-                print(f"[Herramienta: {_n}]")
-                _res = ejecutar_herramienta(_n, _inp)
-                _res_str = str(_res)
-                _prev = _res_str[:300] + ("…" if len(_res_str) > 300 else "")
-                print(f"[→ {_prev}]")
-                tool_log.append(f"{_n}({json.dumps(_inp, ensure_ascii=False, default=str)}) → {_res_str[:400]}")
-                messages.append({"role": "tool", "tool_call_id": _tc.id, "content": _res_str})
-            if MODO_ACTUAL != _modo_cont:
-                messages[0] = {"role": "system", "content": SYSTEM_PROMPT + _ZHIPU_ACTION_SUFFIX}
-        # while vuelve a verificar completitud tras el batch
+            }]
+            _resp_res = client.chat.completions.create(
+                model=MODELO,
+                messages=_msgs_resumen,
+                max_tokens=350,
+                temperature=0.3,
+            )
+            _texto_res = (_resp_res.choices[0].message.content or "").strip()
+            _texto_res = re.sub(r"<think>.*?</think>", "", _texto_res, flags=re.DOTALL).strip()
+            if _texto_res:
+                respuesta_final = _texto_res
+                print("\nAgente:", respuesta_final)
+        except Exception as _e_res:
+            print(f"[Error generando resumen: {_e_res}]")
 
     # Guardar resumen de tools al historial para contexto del próximo turno
     if tool_log:
@@ -2593,6 +2596,30 @@ def _procesar_adjuntos(texto_usuario, rutas):
     return "".join(partes), imagenes
 
 
+def _ocr_imagenes(imagenes):
+    """Extrae texto de imágenes via OCR (pytesseract). Retorna string con el resultado."""
+    import base64, io
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return "[OCR no disponible: instala pytesseract y pillow]"
+
+    partes = []
+    for i, img in enumerate(imagenes, 1):
+        try:
+            data = base64.b64decode(img["data_b64"])
+            pil_img = Image.open(io.BytesIO(data))
+            texto_ocr = pytesseract.image_to_string(pil_img, lang="eng").strip()
+            if texto_ocr:
+                partes.append(f"[Imagen {i} — texto extraído por OCR]:\n{texto_ocr}")
+            else:
+                partes.append(f"[Imagen {i}: sin texto detectable por OCR]")
+        except Exception as ex:
+            partes.append(f"[Imagen {i}: error OCR — {ex}]")
+    return "\n\n".join(partes)
+
+
 def _content_anthropic(texto, imagenes):
     """Construye lista de content blocks para Anthropic API."""
     content = [{"type": "text", "text": texto}]
@@ -2615,7 +2642,96 @@ def _content_openai(texto, imagenes):
     return content
 
 
+_MODO_KEYWORDS_PRE = {
+    "fullstack":      ["html", "css", "javascript", "js", "react", "página web", "pagina web",
+                       "web", "frontend", "diseño", "pdf", "imprimir", "interfaz", "ui", "responsive"],
+    "data_engineer":  ["sql", "bigquery", "pipeline", "etl", "datos", "dataset", "query",
+                       "dataframe", "pandas", "spark", "airflow"],
+    "devops":         ["docker", "kubernetes", "ci-cd", "ci/cd", "deploy", "infraestructura",
+                       "cloud", "aws", "gcp", "azure", "terraform", "jenkins"],
+    "ciberseguridad": ["seguridad", "vulnerabilidad", "auth", "autenticación", "pentest",
+                       "ssl", "https", "jwt", "contraseña", "password", "hack"],
+}
+
+def _predetectar_modo(texto):
+    """Detecta modo por keywords antes del LLM call. Solo actúa desde modo default."""
+    if MODO_ACTUAL != "default":
+        return
+    t = texto.lower()
+    for modo, keywords in _MODO_KEYWORDS_PRE.items():
+        if modo not in MODOS:
+            continue
+        if any(kw in t for kw in keywords):
+            resultado = ejecutar_herramienta("cambiar_modo", {"modo": modo})
+            print(f"[Modo pre-detectado: {modo} — {resultado}]")
+            return
+
+
+_EXTS_TEXTO = {".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".py",
+               ".json", ".md", ".txt", ".yaml", ".yml", ".env", ".xml", ".csv"}
+_CACHE_MAX_BYTES = 20_000   # no cargar archivos > 20 KB al cache (menos tokens → LLM más rápido)
+_CACHE_MAX_FILES = 12       # límite de archivos por proyecto
+
+
+def _poblar_cache_proyecto(ruta_dir):
+    """Lee todos los archivos de texto del proyecto al cache. Llamar tras definir RUTA_PROYECTO."""
+    if not ruta_dir or not os.path.isdir(ruta_dir):
+        return
+    base = os.path.abspath(ruta_dir)
+    cargados = 0
+    omitidos = []
+    for root, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv")]
+        for fname in sorted(files):
+            if cargados >= _CACHE_MAX_FILES:
+                break
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in _EXTS_TEXTO:
+                continue
+            fpath = os.path.join(root, fname)
+            if os.path.getsize(fpath) > _CACHE_MAX_BYTES:
+                omitidos.append(fname)
+                continue
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    contenido = f.read()
+                _CACHE_ARCHIVOS[fpath] = contenido
+                _ARCHIVOS_LEIDOS.add(fpath)
+                cargados += 1
+            except OSError:
+                pass
+    resumen = f"[Cache: {cargados} archivos cargados"
+    if omitidos:
+        resumen += f" | omitidos por tamaño: {', '.join(omitidos)}"
+    resumen += "]"
+    print(resumen)
+
+
+def _precargar_ruta(mensaje_usuario=""):
+    """Gestión de ruta antes del LLM call:
+    - Ruta ya definida en esta sesión → usarla sin preguntar.
+    - Sin ruta en sesión → abrir selector inmediatamente (no esperar al LLM).
+    Nunca restaura desde disco — la ruta siempre la elige el usuario explícitamente.
+    """
+    if MODO_ACTUAL == "default":
+        return
+    if RUTA_PROYECTO[0] and os.path.isdir(RUTA_PROYECTO[0]):
+        # Poblar cache si aún está vacío (primera vez en esta sesión)
+        if not _CACHE_ARCHIVOS:
+            _poblar_cache_proyecto(RUTA_PROYECTO[0])
+        return  # ya definida en esta sesión
+    # Sin ruta en sesión → pedir ahora, sin gastar 1 LLM call
+    if _solicitar_ruta[0]:
+        print("[Ruta no configurada — abriendo selector...]")
+        _solicitar_ruta[0]()
+        # Poblar cache con los archivos del proyecto recién seleccionado
+        if RUTA_PROYECTO[0]:
+            _poblar_cache_proyecto(RUTA_PROYECTO[0])
+
+
 def correr_agente(mensaje_usuario, imagenes=None):
+    _predetectar_modo(mensaje_usuario)
+    _precargar_ruta(mensaje_usuario)
     print(f"[Backend: {BACKEND} | {MODOS_ETIQUETAS[MODO_ACTUAL]}]\n")
     if BACKEND == "anthropic":
         correr_agente_anthropic(mensaje_usuario, imagenes=imagenes)
@@ -2836,6 +2952,7 @@ if __name__ == "__main__":
         btn_cancelar.pack(side=tk.LEFT, padx=10)
 
     def _solicitar_ruta_desde_hilo():
+        import time as _time
         evento = threading.Event()
         def callback(ruta):
             RUTA_PROYECTO[0] = ruta
@@ -2843,7 +2960,11 @@ if __name__ == "__main__":
                 msg_queue.put(("verificar_contexto", ruta))
             evento.set()
         msg_queue.put(("ruta", callback))
+        _t_ruta = _time.perf_counter()
         evento.wait()
+        _elapsed_ruta = _time.perf_counter() - _t_ruta
+        _elegida = RUTA_PROYECTO[0] or "cancelado"
+        print(f"[⏱ selector de ruta: {_elapsed_ruta:.1f}s — {_elegida}]")
         return RUTA_PROYECTO[0]
 
     _solicitar_ruta[0] = _solicitar_ruta_desde_hilo
@@ -2917,13 +3038,17 @@ if __name__ == "__main__":
         dialogo.after(50, lambda: dialogo.focus_set())
 
     def _solicitar_confirmacion_desde_hilo(pregunta):
+        import time as _time
         evento    = threading.Event()
         resultado = [False]
         def callback(val):
             resultado[0] = val
             evento.set()
         msg_queue.put(("confirmacion", (pregunta, callback)))
+        _t_dialogo = _time.perf_counter()
         evento.wait()
+        _elapsed_dialogo = _time.perf_counter() - _t_dialogo
+        print(f"[⏱ diálogo confirmación: {_elapsed_dialogo:.1f}s — {'aprobado' if resultado[0] else 'rechazado'}]")
         return resultado[0]
 
     _solicitar_confirmacion[0] = _solicitar_confirmacion_desde_hilo
@@ -3065,6 +3190,84 @@ if __name__ == "__main__":
 
         dialogo.protocol("WM_DELETE_WINDOW", _cerrar_sin_guardar)
 
+    def _traducir_actividad(raw):
+        """Convierte una línea [bracket] interna a texto legible para el usuario.
+        Devuelve None si la línea debe ignorarse (tecnicismo sin valor UX)."""
+        import re as _re
+        s = raw.strip()
+        # Resultado de herramienta: [→ ...]
+        if s.startswith("[→ ") and s.endswith("]"):
+            nombre = s[3:-1].strip()
+            # Archivo editado/creado
+            if nombre.startswith("Archivo editado:"):
+                fname = nombre.split(":")[1].split("—")[0].strip()
+                return f"Editado: {fname}"
+            if nombre.startswith("Archivo creado:"):
+                fname = nombre.split(":")[1].split("—")[0].strip()
+                return f"Creado: {fname}"
+            # Output de listar_archivos ([arch] / [dir])
+            if nombre.startswith("[arch]") or nombre.startswith("[dir]"):
+                return None
+            # Nombre de archivo simple (leer_archivo)
+            if nombre and "…" not in nombre and ":" not in nombre and len(nombre) < 80:
+                return f"Leyendo {nombre}..."
+        # Tool timing: [⏱ nombre: Xs]
+        m = _re.match(r'\[⏱ (\w+): ([\d.]+)s\]', s)
+        if m:
+            nombre_tool, secs = m.group(1), float(m.group(2))
+            _map = {
+                "leer_archivo": None,          # ya se vio como [→ archivo]
+                "listar_archivos": f"Listando archivos ({secs:.1f}s)...",
+                "crear_archivo": f"Creando archivo ({secs:.1f}s)...",
+                "editar_archivo": f"Editando archivo ({secs:.1f}s)...",
+                "buscar_en_archivos": f"Buscando en archivos ({secs:.1f}s)...",
+                "ejecutar_comando": f"Ejecutando comando ({secs:.1f}s)...",
+                "cambiar_modo": None,
+                "solicitar_ruta_proyecto": None,
+            }
+            if nombre_tool in _map:
+                return _map[nombre_tool]
+            if nombre_tool.startswith("LLM"):
+                return None
+            return f"{nombre_tool.replace('_', ' ')} ({secs:.1f}s)..."
+        # LLM call: [⏱ LLM #N: Xs]
+        if _re.match(r'\[⏱ LLM #\d+', s):
+            return None
+        # Herramienta: [Herramienta: X]
+        m2 = _re.match(r'\[Herramienta: (\w+)\]', s)
+        if m2:
+            _map2 = {
+                "leer_archivo": "Leyendo archivo...",
+                "listar_archivos": "Listando archivos...",
+                "crear_archivo": "Creando archivo...",
+                "editar_archivo": "Editando archivo...",
+                "buscar_en_archivos": "Buscando...",
+                "ejecutar_comando": "Ejecutando comando...",
+                "pedir_confirmacion": "Esperando confirmación...",
+            }
+            return _map2.get(m2.group(1), f"Usando {m2.group(1).replace('_', ' ')}...")
+        # Cache cargado
+        if s.startswith("[Cache:"):
+            mc = _re.search(r'(\d+) archivos', s)
+            n = mc.group(1) if mc else "?"
+            return f"Proyecto cargado — {n} archivos en memoria"
+        # Selector de ruta
+        if "Ruta no configurada" in s or "abriendo selector" in s:
+            return "Seleccionando carpeta del proyecto..."
+        if "selector de ruta" in s:
+            return None
+        # LLM pensando (antes de cada llamada al modelo)
+        if _re.match(r'\[Pensando #\d+', s):
+            return "Consultando IA..."
+        # Resumen post-loop
+        if s.startswith("[Generando resumen"):
+            return "Generando resumen..."
+        # Backend / modo / timings de herramientas silenciosas → ignorar
+        if s.startswith("[Backend:") or "Modo pre-detectado" in s or "Detención" in s:
+            return None
+        # Fallback: mostrar sin corchetes
+        return s.lstrip("[").rstrip("]").strip() or None
+
     def check_queue():
         try:
             while True:
@@ -3091,7 +3294,49 @@ if __name__ == "__main__":
                         if _sync_menu_modos_ref[0]:
                             _sync_menu_modos_ref[0]()
                     elif tag == "agente":
-                        _insertar_mensaje_agente(contenido)
+                        stripped = contenido.strip()
+                        if _burbuja_activa[0] and stripped.startswith("["):
+                            import re as _re_ck
+                            _es_inicio_llm  = bool(_re_ck.match(r'\[Pensando #\d+', stripped))
+                            _es_fin_llm     = bool(_re_ck.match(r'\[⏱ LLM #\d+', stripped))
+                            _es_inicio_tool = bool(_re_ck.match(r'\[Herramienta: \w+\]', stripped))
+                            _es_fin_tool    = (
+                                bool(_re_ck.match(r'\[⏱ \w+: [\d.]+s\]', stripped))
+                                and not _es_fin_llm
+                            )
+                            _es_cache       = stripped.startswith("[Cache:")
+                            legible = _traducir_actividad(stripped)
+                            if _es_inicio_llm:
+                                # LLM empieza → "Consultando IA..." como acción actual
+                                _burbuja_actual[0] = "Consultando IA..."
+                                _burbuja_redibujar()
+                            elif _es_fin_llm:
+                                # LLM terminó → limpiar actual (pronto vendrá tool o respuesta)
+                                _burbuja_actual[0] = None
+                                _burbuja_redibujar()
+                            elif _es_inicio_tool and legible:
+                                # Herramienta empieza → mover actual (si era tool) a completada
+                                if _burbuja_actual[0] and _burbuja_actual[0] != "Consultando IA...":
+                                    _burbuja_completada[0] = _burbuja_actual[0]
+                                _burbuja_actual[0] = legible
+                                _burbuja_redibujar()
+                            elif _es_fin_tool:
+                                # Herramienta terminó → mover actual a completada
+                                if _burbuja_actual[0]:
+                                    _burbuja_completada[0] = _burbuja_actual[0]
+                                _burbuja_actual[0] = None
+                                _burbuja_redibujar()
+                            elif _es_cache and legible:
+                                _burbuja_actual[0] = legible
+                                _burbuja_redibujar()
+                            elif legible:
+                                # [→ filename], [Generando resumen...], etc. → actualizar actual
+                                _burbuja_actual[0] = legible
+                                _burbuja_redibujar()
+                        else:
+                            # Respuesta final → cerrar burbuja y mostrar normal
+                            _burbuja_cerrar()
+                            _insertar_mensaje_agente(contenido)
                     elif tag == "resumen":
                         agregar_texto("\n" + contenido + "\n", "resumen")
                     else:
@@ -3107,22 +3352,68 @@ if __name__ == "__main__":
             _print_original(f"[refrescar_pills error] {_ex}")
         ventana.after(100, check_queue)
 
-    # --- Indicador de procesamiento ---
-    _procesando   = [False]
-    _anim_job     = [None]
-    _anim_idx     = [0]
-    _anim_frames  = ["Procesando ·  ", "Procesando ·· ", "Procesando ···"]
+    # --- Indicador de procesamiento (burbuja en chat + barra inferior) ---
+    _procesando      = [False]
+    _anim_job        = [None]
+    _anim_idx        = [0]
+    _anim_spinners   = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    _burbuja_activa     = [False]
+    _burbuja_completada = [None]   # última acción de herramienta completada (con ✓)
+    _burbuja_actual     = [None]   # acción en curso (recibe spinner)
+
+    def _burbuja_redibujar(spinner=""):
+        """Borra el texto previo del tag 'burbuja' y reinscribe al final. Solo hilo principal."""
+        if not _burbuja_activa[0]:
+            return
+        try:
+            area.config(state="normal")
+            ranges = area.tag_ranges("burbuja")
+            for i in range(len(ranges) - 2, -1, -2):
+                area.delete(ranges[i], ranges[i + 1])
+            partes = []
+            if _burbuja_completada[0]:
+                partes.append(f"  ✓ {_burbuja_completada[0]}")
+            if _burbuja_actual[0]:
+                suf = f"  {spinner}" if spinner else ""
+                partes.append(f"  {_burbuja_actual[0]}{suf}")
+            elif spinner:
+                partes.append(f"  {spinner}")
+            if partes:
+                area.insert(tk.END, "\n".join(partes) + "\n", ("actividad", "burbuja"))
+            area.config(state="disabled")
+            area.see(tk.END)
+        except Exception:
+            pass
+
+    def _burbuja_cerrar():
+        """Elimina la burbuja del chat y desactiva el modo burbuja."""
+        _burbuja_activa[0]     = False
+        _burbuja_completada[0] = None
+        _burbuja_actual[0]     = None
+        try:
+            area.config(state="normal")
+            ranges = area.tag_ranges("burbuja")
+            for i in range(len(ranges) - 2, -1, -2):
+                area.delete(ranges[i], ranges[i + 1])
+            area.config(state="disabled")
+        except Exception:
+            pass
 
     def _animar():
         if not _procesando[0]:
             return
-        lbl_estado.config(text=_anim_frames[_anim_idx[0] % 3], fg="#cc6600")
+        sp = _anim_spinners[_anim_idx[0] % len(_anim_spinners)]
+        lbl_estado.config(text=f"Procesando {sp}", fg="#cc6600")
+        _burbuja_redibujar(spinner=f"  {sp}")
         _anim_idx[0] += 1
-        _anim_job[0] = ventana.after(400, _animar)
+        _anim_job[0] = ventana.after(150, _animar)
 
     def iniciar_procesando():
-        _procesando[0] = True
-        _anim_idx[0]   = 0
+        _procesando[0]         = True
+        _burbuja_activa[0]     = True
+        _anim_idx[0]           = 0
+        _burbuja_completada[0] = None
+        _burbuja_actual[0]     = None
         _animar()
 
     def detener_procesando():
@@ -3131,6 +3422,7 @@ if __name__ == "__main__":
             ventana.after_cancel(_anim_job[0])
             _anim_job[0] = None
         lbl_estado.config(text="")
+        _burbuja_cerrar()
 
     def enviar():
         mensaje = entrada.get("1.0", "end-1c").strip()
@@ -3149,6 +3441,13 @@ if __name__ == "__main__":
         if mensaje in ("/compact", "/compactar"):
             resultado = compactar_historial()
             agregar_texto(f"Sistema: {resultado}\n\n", "sistema")
+            return
+
+        if mensaje in ("/clearcache", "/limpiar_cache", "/cache"):
+            n = len(_CACHE_ARCHIVOS)
+            _CACHE_ARCHIVOS.clear()
+            _ARCHIVOS_LEIDOS.clear()
+            agregar_texto(f"Sistema: Cache limpiado — {n} archivos eliminados de memoria.\n\n", "sistema")
             return
 
         # Procesar adjuntos: extraer texto/base64 y limpiar lista
@@ -3178,28 +3477,27 @@ if __name__ == "__main__":
                 _n_msgs[0] += 1
 
         def ejecutar():
+            import time as _time
             _n_msgs[0] = 0
             builtins.print = print_a_cola
             _es_creacion = _detectar_intencion_creacion(texto_final)
             _texto_para_agente = texto_final
+            _t_inicio = _time.perf_counter()
             try:
                 if _es_creacion:
                     msg_queue.put(("sistema", "✨ Enriqueciendo solicitud...\n"))
+                    _t_enrich = _time.perf_counter()
                     _enriquecido = _enriquecer_prompt_creacion(texto_final)
+                    _elapsed_enrich = _time.perf_counter() - _t_enrich
                     if _enriquecido and _enriquecido != texto_final:
                         _texto_para_agente = _enriquecido
-                        msg_queue.put(("sistema", "📝 Prompt mejorado — enviando al especialista...\n\n"))
+                        msg_queue.put(("sistema", f"📝 Prompt mejorado ⏱ {_elapsed_enrich:.1f}s — enviando al especialista...\n\n"))
                 correr_agente(_texto_para_agente, imagenes=_imgs)
+                _elapsed = _time.perf_counter() - _t_inicio
                 if _n_msgs[0] == 0:
-                    msg_queue.put(("sistema", "Agente finalizó sin respuesta visible. Sin cambios realizados.\n\n"))
+                    msg_queue.put(("sistema", f"Agente finalizó sin respuesta visible. Sin cambios realizados. ⏱ {_elapsed:.1f}s\n\n"))
                 else:
-                    if _es_creacion:
-                        msg_queue.put(("sistema", "⏳ Generando resumen y guía de uso...\n"))
-                        _resumen = _generar_resumen_post_creacion(texto_final)
-                        if _resumen:
-                            separador = "─" * 48
-                            msg_queue.put(("resumen", f"\n{separador}\n📋 RESUMEN Y GUÍA DE USO\n{separador}\n{_resumen}\n{separador}\n"))
-                    msg_queue.put(("agente", "\n"))
+                    msg_queue.put(("sistema", f"⏱ {_elapsed:.1f}s\n\n"))
             except Exception as ex:
                 msg_queue.put(("error", f"Error: {ex}\n"))
             finally:
@@ -3662,6 +3960,8 @@ if __name__ == "__main__":
     area.tag_config("sistema",       foreground="#a6adc8", font=("Menlo", 11, "italic"))
     area.tag_config("resumen",       foreground="#89dceb", font=("Menlo", 11),
                     lmargin1=8, lmargin2=8)
+    area.tag_config("actividad",     foreground="#6c7086", font=("Menlo", 10, "italic"),
+                    lmargin1=12, lmargin2=12)
 
     _CODE_SPLIT_RE = re.compile(r'(```[\s\S]*?```|`[^`\n]+`)')
 
