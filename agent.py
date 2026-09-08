@@ -423,17 +423,21 @@ TOOLS = [
         "name": "solicitar_ruta_proyecto",
         "description": (
             "Configura la carpeta raíz del proyecto. "
-            "Si el usuario mencionó una ruta en su mensaje, pásala en 'ruta_sugerida' — "
-            "si existe, se configura automáticamente sin mostrar diálogo. "
-            "Si no hay ruta sugerida, muestra un selector al usuario. "
-            "OBLIGATORIO: llama a esta herramienta ANTES de usar crear_archivo, crear_carpeta o leer_archivo."
+            "CASOS DE USO: "
+            "(1) El usuario mencionó una ruta en su mensaje → llama con ruta_sugerida='<esa ruta>' — se configura sin diálogo. "
+            "(2) El usuario pide abrir selector / cambiar ruta / 'solicita la ruta' → llama con ruta_sugerida='SELECTOR' — abre el diálogo gráfico. "
+            "(3) Sin ruta conocida → llama sin argumentos — abre el diálogo gráfico. "
+            "OBLIGATORIO antes de usar crear_archivo, editar_archivo, leer_archivo, listar_archivos."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "ruta_sugerida": {
                     "type": "string",
-                    "description": "Ruta inferida del mensaje del usuario, ej: 'development/cotizacion_lab'. Relativa al directorio del agente o absoluta."
+                    "description": (
+                        "Ruta inferida del mensaje del usuario (relativa al agente o absoluta), "
+                        "o la cadena 'SELECTOR' para forzar apertura del diálogo gráfico aunque ya haya una ruta activa."
+                    )
                 }
             },
             "required": []
@@ -768,8 +772,11 @@ def _asegurar_ruta_proyecto():
     """Abre el selector de ruta automáticamente si no hay ruta configurada.
     Retorna None si la ruta ya está configurada o el usuario eligió una.
     Retorna str de error si el usuario canceló o el selector no está disponible."""
-    if RUTA_PROYECTO[0]:
+    if RUTA_PROYECTO[0] and os.path.isdir(RUTA_PROYECTO[0]):
         return None
+    if RUTA_PROYECTO[0] and not os.path.isdir(RUTA_PROYECTO[0]):
+        # Ruta configurada pero el directorio ya no existe — resetear y pedir de nuevo
+        RUTA_PROYECTO[0] = None
     if _solicitar_ruta[0]:
         ruta = _solicitar_ruta[0]()
         if ruta:
@@ -951,19 +958,29 @@ def _despachar_herramienta(nombre, inputs):
         return "Confirmación no disponible. Procede."
 
     if nombre == "solicitar_ruta_proyecto":
-        # Si ya hay ruta en esta sesión, no abrir selector de nuevo
-        if RUTA_PROYECTO[0] and os.path.isdir(RUTA_PROYECTO[0]):
+        # Si ya hay ruta válida y no se pidió una sugerida, informar pero permitir cambio
+        if RUTA_PROYECTO[0] and os.path.isdir(RUTA_PROYECTO[0]) and not inputs.get("ruta_sugerida", "").strip():
             return (
-                f"Ruta ya configurada en esta sesión: {RUTA_PROYECTO[0]}\n"
-                f"Usa ruta_relativa relativa a esa carpeta. No necesitas volver a pedirla."
+                f"Ruta activa: {RUTA_PROYECTO[0]}\n"
+                f"Si el usuario mencionó otra ruta o quiere cambiarla, llama solicitar_ruta_proyecto(ruta_sugerida='<la ruta nueva>').\n"
+                f"Si quiere que abra el selector gráfico, llama solicitar_ruta_proyecto(ruta_sugerida='SELECTOR')."
             )
         ruta_sugerida = inputs.get("ruta_sugerida", "").strip()
+        # "SELECTOR" es la palabra clave para forzar apertura del diálogo gráfico
+        if ruta_sugerida.upper() == "SELECTOR":
+            ruta_sugerida = ""
         if ruta_sugerida:
             if os.path.isabs(ruta_sugerida):
                 ruta_resuelta = ruta_sugerida
             else:
                 ruta_resuelta = os.path.join(AGENT_DIR, ruta_sugerida)
             ruta_resuelta = os.path.abspath(ruta_resuelta)
+            if not os.path.isdir(ruta_resuelta):
+                # Ruta sugerida no existe — intentar crearla o abrir selector con contexto
+                try:
+                    os.makedirs(ruta_resuelta, exist_ok=True)
+                except OSError:
+                    pass
             if os.path.isdir(ruta_resuelta):
                 # Si ya hay una ruta activa diferente, pedir confirmación antes de cambiarla
                 if RUTA_PROYECTO[0] and os.path.abspath(RUTA_PROYECTO[0]) != ruta_resuelta:
@@ -993,6 +1010,12 @@ def _despachar_herramienta(nombre, inputs):
                     f"Procede AHORA con la tarea. NO hagas más preguntas."
                 )
         if _solicitar_ruta[0]:
+            _aviso_selector = (
+                f"La ruta '{ruta_sugerida}' no existe o no es accesible. "
+                f"Abriendo selector gráfico para que el usuario elija la carpeta correcta."
+            ) if ruta_sugerida else ""
+            if _aviso_selector:
+                print(f"[{_aviso_selector}]")
             ruta = _solicitar_ruta[0]()
             if ruta:
                 os.makedirs(ruta, exist_ok=True)
@@ -1214,11 +1237,16 @@ def _despachar_herramienta(nombre, inputs):
         except OSError as e:
             return f"Error al leer '{ruta_abs}': {type(e).__name__}: {e}"
         if ruta_abs not in _ARCHIVOS_LEIDOS:
-            return (
-                f"Error: debes llamar leer_archivo('{inputs['ruta_relativa']}') "
-                f"antes de editar. Nunca escribas texto_original de memoria — "
-                f"copia el texto exacto del archivo leído."
-            )
+            if ruta_abs in _CACHE_ARCHIVOS:
+                # El archivo está en cache (inyectado en contexto o leído en turno anterior).
+                # Habilitar edición sin requerir leer_archivo adicional.
+                _ARCHIVOS_LEIDOS.add(ruta_abs)
+            else:
+                return (
+                    f"Error: debes llamar leer_archivo('{inputs['ruta_relativa']}') "
+                    f"antes de editar. Nunca escribas texto_original de memoria — "
+                    f"copia el texto exacto del archivo leído."
+                )
         texto_original = inputs["texto_original"]
         texto_nuevo = inputs["texto_nuevo"]
         if texto_original == texto_nuevo:
@@ -2154,14 +2182,15 @@ _ZHIPU_ACTION_SUFFIX = (
     "Si necesitas leer MÚLTIPLES archivos, llama leer_archivo para TODOS ellos en una SOLA respuesta — "
     "nunca leas un archivo por respuesta. El sistema procesará todas las llamadas en paralelo.\n\n"
     "REGLA 0b — PLAN ANTES DE EJECUTAR:\n"
-    "Antes de usar herramientas, escribe en texto:\n"
-    "  1. Qué vas a hacer (2-4 líneas máximo).\n"
-    "  2. Llama pedir_confirmacion() con ese plan resumido.\n"
-    "  3. Solo si el usuario aprueba, ejecuta TODAS las herramientas necesarias en esa misma respuesta.\n"
-    "  EXCEPCIÓN: si la acción es de solo lectura (leer_archivo, listar_archivos, buscar_*) NO pidas confirmación — ejecuta directo.\n\n"
+    "Antes de escribir o modificar archivos:\n"
+    "  1. Llama pedir_confirmacion() con un resumen del plan (qué archivos y qué cambios).\n"
+    "  2. Cuando el usuario apruebe, ejecuta TODOS los editar_archivo / crear_archivo en ESA MISMA respuesta — sin iteraciones intermedias.\n"
+    "  EXCEPCIÓN: si la acción es de solo lectura (leer_archivo, listar_archivos, buscar_*) NO pidas confirmación.\n"
+    "  EXCEPCIÓN 2: si los archivos ya están en el contexto inyectado [PROYECTO EN CONTEXTO], no leas ni listes — ve directo al paso 1.\n\n"
     "REGLA 1 — DOS CASOS antes de actuar: "
     "(A) Usuario quiere abrir sesión de trabajo ('quiero modificar', 'quiero trabajar en', 'ayúdame con') "
-    "→ carga el contexto: pide ruta, lista archivos, lee los relevantes, explica qué hay, pregunta qué cambiar. "
+    "→ si ya hay [PROYECTO EN CONTEXTO] en el contexto, explica qué hay y pregunta qué cambiar — NO repitas leer ni listar. "
+    "Si no hay contexto, pide ruta, lista archivos, lee los relevantes, explica qué hay, pregunta qué cambiar. "
     "(B) Usuario reporta problema sin describirlo ('corrige', 'arregla', 'soluciona', 'no funciona') "
     "→ haz UNA pregunta de aclaración ANTES de leer cualquier archivo. "
     "Leer archivos sin saber qué buscar cuando hay un bug reportado es alucinación anticipada — prohibido.\n"
@@ -2172,11 +2201,16 @@ _ZHIPU_ACTION_SUFFIX = (
     "Decir 'voy a hacer X' sin llamar la herramienta es un error.\n"
     "Si necesitas la ruta del proyecto, llama solicitar_ruta_proyecto AHORA — "
     "NUNCA le preguntes la ruta al usuario por texto. "
-    "El selector de carpeta se abrirá automáticamente.\n"
-    "REGLA DE EDICIÓN: SIEMPRE llama leer_archivo ANTES de editar_archivo. "
-    "Nunca escribas texto_original de memoria — copia el texto exacto del archivo leído. "
-    "DESPUÉS de cada editar_archivo, el archivo queda invalidado: si necesitas editar el mismo archivo "
-    "otra vez, llama leer_archivo nuevamente antes — de lo contrario el sistema bloqueará el edit.\n"
+    "El selector de carpeta se abrirá automáticamente. "
+    "Si el usuario YA mencionó una ruta en su mensaje (ej: '/Users/.../mi_proyecto'), "
+    "llama solicitar_ruta_proyecto(ruta_sugerida='<esa ruta>') para configurarla. "
+    "Si el usuario pide 'abre el selector' o 'solicita la ruta', llama solicitar_ruta_proyecto(ruta_sugerida='SELECTOR').\n"
+    "REGLA DE EDICIÓN: Si el archivo YA está en el contexto inyectado [PROYECTO EN CONTEXTO], "
+    "edita directamente — NO llames leer_archivo. "
+    "Si el archivo NO está en el contexto, llama leer_archivo antes de editar. "
+    "Nunca escribas texto_original de memoria — copia el texto exacto del contexto o del archivo leído. "
+    "EXCEPCIÓN post-edit: si hiciste editar_archivo sobre un archivo y necesitas editarlo OTRA VEZ "
+    "en el mismo turno, llama leer_archivo entre edits para obtener el contenido actualizado.\n"
     "REGLA 3+ CAMBIOS: Si necesitas 3 o más modificaciones en el mismo archivo, usa crear_archivo "
     "con el contenido completo reescrito — NO hagas N llamadas a editar_archivo.\n"
     "REGLA ejecutar_comando: Para ejecutar comandos de terminal (npm, pip, docker, kubectl, tests), "
@@ -2202,9 +2236,21 @@ def correr_agente_zhipu(mensaje_usuario, imagenes=None):
         mensaje_usuario = f"{mensaje_usuario}\n\n{texto_ocr}"
         imagenes = None
     _historial.append({"role": "user", "content": mensaje_usuario})
+
+    # Compactar historial automáticamente si es muy largo (causa respuestas lentas)
+    _msgs_historial = [e for e in _historial if e["role"] in ("user", "assistant")]
+    if len(_msgs_historial) > 20:
+        print(f"[Historial largo ({len(_msgs_historial)} mensajes) — compactando automáticamente para acelerar...]")
+        _historial.pop()  # quitar el mensaje que acabamos de agregar antes de compactar
+        resultado_compact = compactar_historial()
+        print(f"[{resultado_compact}]")
+        _historial.append({"role": "user", "content": mensaje_usuario})
+        _msgs_historial = [e for e in _historial if e["role"] in ("user", "assistant")]
+    elif len(_msgs_historial) > 14:
+        print(f"[⚠ Historial largo: {len(_msgs_historial)} mensajes — usa /compact para acelerar respuestas]")
+
     messages = [{"role": "system", "content": SYSTEM_PROMPT + _ZHIPU_ACTION_SUFFIX}]
-    messages += [{"role": e["role"], "content": e["content"]} for e in _historial
-                 if e["role"] in ("user", "assistant")]
+    messages += [{"role": e["role"], "content": e["content"]} for e in _msgs_historial]
 
     # Inyectar archivos en cache como contexto sintético — evita leer_archivo y listar_archivos
     if _CACHE_ARCHIVOS and RUTA_PROYECTO[0]:
@@ -2217,8 +2263,9 @@ def correr_agente_zhipu(mensaje_usuario, imagenes=None):
             except ValueError:
                 _rel_c = _ruta_abs_c
             _nombres_cache.append(_rel_c)
-            # Truncar a 3000 chars por archivo para mantener contexto compacto
-            _lineas_cache.append(f"--- {_rel_c} ---\n{_cont_c[:3000]}")
+            # Truncar a 1500 chars por archivo — suficiente para entender estructura
+            # El LLM puede llamar leer_archivo para el contenido completo si lo necesita
+            _lineas_cache.append(f"--- {_rel_c} ---\n{_cont_c[:1500]}" + (" [truncado]" if len(_cont_c) > 1500 else ""))
         if _lineas_cache:
             _lista_nombres = ", ".join(_nombres_cache)
             _cache_bloque = "\n\n".join(_lineas_cache)
@@ -3366,6 +3413,7 @@ if __name__ == "__main__":
         if not _burbuja_activa[0]:
             return
         try:
+            _estaba_abajo = area.yview()[1] >= 0.98
             area.config(state="normal")
             ranges = area.tag_ranges("burbuja")
             for i in range(len(ranges) - 2, -1, -2):
@@ -3381,7 +3429,8 @@ if __name__ == "__main__":
             if partes:
                 area.insert(tk.END, "\n".join(partes) + "\n", ("actividad", "burbuja"))
             area.config(state="disabled")
-            area.see(tk.END)
+            if _estaba_abajo:
+                area.see(tk.END)
         except Exception:
             pass
 
@@ -3708,9 +3757,17 @@ if __name__ == "__main__":
         inner = tk.Frame(border, bg=FONDO2)
         inner.pack(fill=tk.BOTH, expand=True)
 
+        # Canvas scrollable con altura máxima
+        _MAX_POPUP_H = 320
+        canvas = tk.Canvas(inner, bg=FONDO2, highlightthickness=0)
+        vsb = tk.Scrollbar(inner, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        scroll_frame = tk.Frame(canvas, bg=FONDO2)
+        _cw = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+
         for nombre, var in _tools_vars.items():
             cb = tk.Checkbutton(
-                inner, text=nombre, variable=var,
+                scroll_frame, text=nombre, variable=var,
                 bg=FONDO2, fg=TEXTO,
                 selectcolor=FONDO,
                 activebackground=FONDO2, activeforeground=TEXTO,
@@ -3718,6 +3775,30 @@ if __name__ == "__main__":
                 command=lambda n=nombre: _on_tool_toggle(n)
             )
             cb.pack(fill=tk.X, padx=10, pady=4)
+
+        def _actualizar_scroll(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(_cw, width=canvas.winfo_width())
+
+        scroll_frame.bind("<Configure>", _actualizar_scroll)
+        canvas.bind("<Configure>", lambda _e: canvas.itemconfig(_cw, width=canvas.winfo_width()))
+
+        # Mousewheel: activo solo cuando el cursor está dentro del popup
+        def _mw(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _mw))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        popup.bind("<Destroy>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        popup.update_idletasks()
+        total_h = scroll_frame.winfo_reqheight()
+        h = min(total_h + 4, _MAX_POPUP_H)
+        canvas.configure(height=h)
+
+        if total_h > _MAX_POPUP_H:
+            vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         popup.update_idletasks()
         x = tools_btn.winfo_rootx()

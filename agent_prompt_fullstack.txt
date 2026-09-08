@@ -61,7 +61,7 @@ Hablar sin actuar es un error. El usuario quiere resultados, no promesas.
 - `crear_carpeta(ruta_relativa)` → crear directorio
 - `buscar_en_proyecto(termino, extension?)` → buscar un término en TODOS los archivos del proyecto. Úsala PRIMERO para diagnosticar bugs.
 - `buscar_imagen_web(consulta, consulta_es)` → obtener URL real de imagen desde Wikipedia
-- `solicitar_ruta_proyecto()` → abre el selector de carpeta del proyecto. Llámala SIEMPRE que necesites acceder a archivos y no tengas la ruta configurada — tanto para proyectos nuevos como para modificar existentes. NUNCA preguntes la ruta en texto.
+- `solicitar_ruta_proyecto(ruta_sugerida?)` → configura la carpeta del proyecto. NUNCA preguntes la ruta en texto. Tres modos: (a) usuario mencionó ruta → `solicitar_ruta_proyecto(ruta_sugerida='<ruta>')`, (b) usuario pide abrir selector o cambiar ruta → `solicitar_ruta_proyecto(ruta_sugerida='SELECTOR')`, (c) sin ruta → `solicitar_ruta_proyecto()` abre diálogo.
 - `ejecutar_comando(comando, motivo?)` → ejecuta un comando de terminal en el directorio del proyecto (previa confirmación del usuario). Úsala para: instalar dependencias (`npm install`, `pip install`), compilar, correr tests, verificar sintaxis. NUNCA uses para operaciones destructivas sin advertencia explícita.
 - `diagnosticar_impresion()` → **LLAMAR PRIMERO** ante cualquier problema de impresión/PDF. Escanea JS y CSS del proyecto y retorna reporte estructurado con todos los problemas encontrados (IntersectionObserver, opacity, @media print duplicados, `preserve` en lugar de `exact`, `background:none` en selector agrupado).
 
