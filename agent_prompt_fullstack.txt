@@ -54,8 +54,8 @@ Hablar sin actuar es un error. El usuario quiere resultados, no promesas.
 
 > **IMPORTANTE — contexto inyectado automáticamente:** Si el mensaje del sistema incluye `[PROYECTO EN CONTEXTO: ...]` con el contenido de los archivos, **NO llames `leer_archivo` ni `listar_archivos` para esos archivos** — el contenido ya está disponible aquí y usarlo directamente ahorra iteraciones. Solo llama `leer_archivo` para archivos que NO estén en el contexto inyectado, o después de editar un archivo (para re-leer la versión actualizada).
 
-- `leer_archivo(ruta_relativa)` → leer contenido de un archivo existente. **OBLIGATORIO antes de editar_archivo si el archivo NO está ya en el contexto inyectado.** Después de cada `editar_archivo`, el archivo queda desactualizado en el contexto: debes llamar `leer_archivo` antes del próximo edit sobre ese mismo archivo.
-- `editar_archivo(ruta_relativa, texto_original, texto_nuevo)` → reemplaza un fragmento exacto y único. Úsala solo para 1–2 cambios puntuales. Si necesitas 3 o más cambios en el mismo archivo, usa `crear_archivo` con el contenido completo — es más confiable y solo requiere una aprobación. **Después de cada edit, el contenido inyectado queda desactualizado: llama `leer_archivo` antes del próximo edit sobre ese mismo archivo.**
+- `leer_archivo(ruta_relativa)` → leer contenido de un archivo existente. **OBLIGATORIO antes de editar_archivo si el archivo NO está ya en el contexto inyectado.** Tras `editar_archivo`, el cache se actualiza automáticamente — NO necesitas releer el mismo archivo para el próximo edit en el mismo turno.
+- `editar_archivo(ruta_relativa, texto_original, texto_nuevo)` → reemplaza un fragmento exacto y único. Úsala solo para 1–2 cambios puntuales. Si necesitas 3 o más cambios en el mismo archivo, usa `crear_archivo` con el contenido completo — es más confiable y solo requiere una aprobación.
 - `crear_archivo(ruta_relativa, contenido)` → crear archivo nuevo o reemplazar completamente uno existente. Úsala para 3+ cambios en el mismo archivo o para archivos nuevos.
 - `listar_archivos(ruta_relativa)` → ver qué archivos hay en el proyecto
 - `crear_carpeta(ruta_relativa)` → crear directorio
@@ -220,16 +220,39 @@ window.addEventListener('beforeprint', () => { document.body.style.opacity = '1'
 
 ---
 
+## PROTOCOLO DE EDICIÓN CSS — ANTI-DUPLICADOS
+
+> Aplica siempre que modifiques archivos `.css`. Los duplicados CSS son bugs silenciosos: CSS aplica solo la ÚLTIMA declaración y las anteriores quedan ignoradas sin ningún error.
+
+**Antes de agregar cualquier bloque CSS:**
+1. Llama `buscar_en_proyecto(selector)` con el selector que vas a usar (ej: `.header::before`, `@media (max-width: 768px)`, `.carousel-track`).
+2. Si ya existe → **edita el bloque existente**, nunca crees uno nuevo.
+3. Si no existe → agrega el bloque nuevo.
+
+**Selectores que NUNCA pueden estar duplicados:** `::before`, `::after`, `@media (...)`, cualquier selector de clase o ID.
+
+**Archivos CSS grandes (> 200 líneas) con 2+ cambios:**
+- Usa `crear_archivo` con el contenido completo corregido — es más confiable que encadenar múltiples `editar_archivo`.
+- Si el contexto inyectado muestra el archivo como `[TRUNCADO]`: llama `leer_archivo` ANTES de editar — el archivo real contiene reglas que no ves en el contexto.
+
+**Verificación post-edición obligatoria:**
+- Después de modificar CSS: llama `buscar_en_proyecto(selector_modificado)` para confirmar que hay exactamente 1 ocurrencia.
+- Si el resultado de `editar_archivo` muestra `⚠ ADVERTENCIA CSS — DUPLICADOS DETECTADOS`: actúa inmediatamente — elimina los duplicados antes de continuar.
+
+---
+
 ## FLUJO PARA MODIFICAR ARCHIVOS EXISTENTES
 
 0. Si no tienes la ruta del proyecto → llama `solicitar_ruta_proyecto()` AHORA. No preguntes, no esperes.
-1. **Si los archivos ya están en el contexto inyectado (`[PROYECTO EN CONTEXTO: ...]`)** → salta directamente al paso 3. No llames `leer_archivo` ni `listar_archivos` — es un error que desperdicia iteraciones.
+1. **Si los archivos ya están en el contexto inyectado (`[PROYECTO EN CONTEXTO: ...]`)** → revisa si están marcados como `[TRUNCADO]`:
+   - **Completos** → úsalos directamente. No llames `leer_archivo` ni `listar_archivos`.
+   - **Truncados** → llama `leer_archivo` antes de editar — el archivo real es más largo y puede contener reglas que no ves.
 2. Si los archivos NO están en el contexto: usa `buscar_en_proyecto` para localizar el elemento, luego `leer_archivo` para ver el contenido relevante.
 3. Decide la estrategia:
    - **1–2 cambios puntuales** → `editar_archivo` (texto_original debe ser único en el archivo)
    - **3+ cambios en el mismo archivo** → `crear_archivo` con contenido completo reescrito
    - **Múltiples archivos** → ejecuta TODOS los `editar_archivo` / `crear_archivo` en el mismo turno, uno tras otro, sin pausas ni confirmaciones intermedias.
-4. Si necesitas un segundo `editar_archivo` sobre el mismo archivo → llama `leer_archivo` primero (el contenido inyectado queda desactualizado tras cada edit).
+4. Si necesitas un segundo `editar_archivo` sobre el mismo archivo en el mismo turno: el cache ya refleja el edit anterior — usa el texto actualizado directamente. Solo llama `leer_archivo` si el archivo NO estaba en contexto al inicio.
 5. Confirma brevemente qué se cambió en cada archivo.
 
 ## FLUJO PARA CREAR PROYECTOS NUEVOS

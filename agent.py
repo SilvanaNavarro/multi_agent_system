@@ -193,17 +193,18 @@ def construir_system_prompt(modo):
 
     approval_rule = (
         "\n\n## REGLA DE APROBACIÓN — MODIFICACIÓN DE ARCHIVOS\n"
-        "ANTES de modificar archivos SIEMPRE debes:\n"
+        "ANTES de modificar archivos:\n"
         "1. Explicar en texto QUÉ cambios planeas hacer y POR QUÉ.\n"
-        "2. Llamar pedir_confirmacion UNA SOLA VEZ con el resumen de TODOS los cambios.\n"
-        "3. Solo si el usuario aprueba, ejecutar las herramientas — sin más confirmaciones.\n\n"
+        "2. Llamar pedir_confirmacion UNA SOLA VEZ con el resumen de TODOS los cambios del turno.\n"
+        "3. Cuando el usuario apruebe: ejecutar TODOS los editar_archivo / crear_archivo en ESA MISMA respuesta.\n"
+        "⛔ NUNCA llames pedir_confirmacion más de una vez por turno.\n"
+        "⛔ NUNCA esperes más confirmaciones dentro del loop de edits — una aprobación cubre todos los archivos.\n\n"
         "## REGLA DE EDICIÓN EN LOTE\n"
         "Si necesitas modificar 3 o más secciones del mismo archivo:\n"
         "  → USA crear_archivo con el contenido COMPLETO del archivo ya modificado.\n"
         "  → NO hagas N llamadas a editar_archivo — genera una sola versión final.\n"
         "Si son 1 o 2 cambios puntuales en un archivo grande:\n"
-        "  → USA editar_archivo (texto_original / texto_nuevo) para cada cambio.\n"
-        "NUNCA llames pedir_confirmacion dentro de un loop de edits — una aprobación cubre todos."
+        "  → USA editar_archivo (texto_original / texto_nuevo) para cada cambio en la misma respuesta."
     )
 
     ruta_rule = (
@@ -324,7 +325,8 @@ HERRAMIENTAS_DINAMICAS = {}
 CUSTOM_TOOLS_FILE = "custom_tools.json"
 TOOLS_DESACTIVADAS: set = set()  # nombres de herramientas desactivadas desde la GUI
 _ARCHIVOS_LEIDOS: set = set()  # rutas absolutas leídas en esta sesión (enforcement Read→Edit)
-_CACHE_ARCHIVOS: dict = {}     # ruta_rel -> contenido; persiste entre turnos para evitar re-lecturas
+_CACHE_ARCHIVOS: dict = {}     # ruta_abs -> contenido; solo archivos explícitamente leídos por leer_archivo
+_CACHE_INDEX:   dict = {}     # ruta_abs -> {rel, chars, lines}; índice ligero de todos los archivos del proyecto
 
 TOOLS = [
     {
@@ -1061,19 +1063,8 @@ def _despachar_herramienta(nombre, inputs):
         ruta_abs, err = _ruta_segura(inputs["ruta_relativa"])
         if err:
             return err
-        if _solicitar_confirmacion[0]:
-            n_chars  = len(inputs.get("contenido", ""))
-            n_lineas = inputs.get("contenido", "").count("\n") + 1
-            preview  = "\n".join(inputs.get("contenido", "").splitlines()[:15])
-            pregunta = (
-                f"El agente quiere CREAR el archivo '{inputs['ruta_relativa']}' "
-                f"({n_lineas} líneas / {n_chars} chars).\n\n"
-                f"Primeras 15 líneas:\n{preview}"
-                + ("\n[...]" if n_lineas > 15 else "")
-            )
-            aprobado = _solicitar_confirmacion[0](pregunta)
-            if not aprobado:
-                return f"El usuario rechazó crear '{inputs['ruta_relativa']}'. No se realizó ningún cambio."
+        # Confirmación única vía pedir_confirmacion antes de este punto.
+        # No repetir diálogo aquí — elimina doble confirmación.
         try:
             os.makedirs(os.path.dirname(ruta_abs) or RUTA_PROYECTO[0], exist_ok=True)
             with open(ruta_abs, "w", encoding="utf-8") as f:
@@ -1302,7 +1293,41 @@ def _despachar_herramienta(nombre, inputs):
         # Actualizar cache con el contenido nuevo — siguiente edit NO requiere re-leer
         _CACHE_ARCHIVOS[ruta_abs] = nuevo_contenido
         _ARCHIVOS_LEIDOS.add(ruta_abs)
-        return f"Archivo editado: {inputs['ruta_relativa']} — reemplazo aplicado."
+        # Retornar contexto verificable: línea aproximada + primeras líneas del texto_nuevo
+        # Permite al LLM confirmar que el cambio se aplicó correctamente sin re-leer el archivo.
+        _linea_edit = nuevo_contenido[:nuevo_contenido.find(texto_nuevo)].count('\n') + 1
+        _preview_nuevo = "\n".join(texto_nuevo.splitlines()[:3])
+        if len(_preview_nuevo) > 120:
+            _preview_nuevo = _preview_nuevo[:120] + "…"
+        resultado_edit = (
+            f"Archivo editado: {inputs['ruta_relativa']} — línea ~{_linea_edit}. "
+            f"Inicio del texto aplicado: {repr(_preview_nuevo)}"
+        )
+        # CSS duplicate detection — detectar selectores duplicados creados por el edit
+        if ruta_abs.endswith('.css'):
+            import re as _re_css_dup
+            _avisos_dup = []
+            # Buscar selectores críticos que nunca deben estar duplicados
+            _patrones_criticos = [
+                r'([a-zA-Z][^\{,\n]*::(?:before|after))\s*\{',  # ::before / ::after
+                r'(@media[^\{]+)',                                  # @media queries
+            ]
+            for _pat in _patrones_criticos:
+                _encontrados = _re_css_dup.findall(_pat, nuevo_contenido)
+                _contados = {}
+                for _sel in _encontrados:
+                    _sel_n = _sel.strip()
+                    _contados[_sel_n] = _contados.get(_sel_n, 0) + 1
+                for _sel_n, _cnt in _contados.items():
+                    if _cnt > 1:
+                        _avisos_dup.append(f"'{_sel_n}' ({_cnt}x)")
+            if _avisos_dup:
+                resultado_edit += (
+                    f"\n⚠ ADVERTENCIA CSS — DUPLICADOS DETECTADOS: {', '.join(_avisos_dup)}. "
+                    f"CSS solo aplica la ÚLTIMA declaración — las anteriores quedan ignoradas. "
+                    f"Usa buscar_en_proyecto o leer_archivo para revisar el archivo completo y eliminar los duplicados."
+                )
+        return resultado_edit
 
     if nombre == "buscar_imagen_web":
         import urllib.request
@@ -2183,10 +2208,12 @@ _ZHIPU_ACTION_SUFFIX = (
     "nunca leas un archivo por respuesta. El sistema procesará todas las llamadas en paralelo.\n\n"
     "REGLA 0b — PLAN ANTES DE EJECUTAR:\n"
     "Antes de escribir o modificar archivos:\n"
-    "  1. Llama pedir_confirmacion() con un resumen del plan (qué archivos y qué cambios).\n"
-    "  2. Cuando el usuario apruebe, ejecuta TODOS los editar_archivo / crear_archivo en ESA MISMA respuesta — sin iteraciones intermedias.\n"
-    "  EXCEPCIÓN: si la acción es de solo lectura (leer_archivo, listar_archivos, buscar_*) NO pidas confirmación.\n"
-    "  EXCEPCIÓN 2: si los archivos ya están en el contexto inyectado [PROYECTO EN CONTEXTO], no leas ni listes — ve directo al paso 1.\n\n"
+    "  1. Llama pedir_confirmacion() UNA SOLA VEZ con resumen del plan (todos los archivos y cambios del turno).\n"
+    "  2. Cuando el usuario apruebe, ejecuta TODOS los editar_archivo / crear_archivo en ESA MISMA respuesta — sin más confirmaciones.\n"
+    "  ⛔ NUNCA llames pedir_confirmacion más de una vez por turno.\n"
+    "  ⛔ NUNCA esperes aprobación entre archivos — una aprobación cubre todo el lote.\n"
+    "  EXCEPCIÓN: acciones de solo lectura (leer_archivo, listar_archivos, buscar_*) NO requieren confirmación.\n"
+    "  EXCEPCIÓN 2: archivos ya en [PROYECTO EN CONTEXTO] → no leas ni listes — ve directo al paso 1.\n\n"
     "REGLA 1 — DOS CASOS antes de actuar: "
     "(A) Usuario quiere abrir sesión de trabajo ('quiero modificar', 'quiero trabajar en', 'ayúdame con') "
     "→ si ya hay [PROYECTO EN CONTEXTO] en el contexto, explica qué hay y pregunta qué cambiar — NO repitas leer ni listar. "
@@ -2205,19 +2232,36 @@ _ZHIPU_ACTION_SUFFIX = (
     "Si el usuario YA mencionó una ruta en su mensaje (ej: '/Users/.../mi_proyecto'), "
     "llama solicitar_ruta_proyecto(ruta_sugerida='<esa ruta>') para configurarla. "
     "Si el usuario pide 'abre el selector' o 'solicita la ruta', llama solicitar_ruta_proyecto(ruta_sugerida='SELECTOR').\n"
-    "REGLA DE EDICIÓN: Si el archivo YA está en el contexto inyectado [PROYECTO EN CONTEXTO], "
-    "edita directamente — NO llames leer_archivo. "
-    "Si el archivo NO está en el contexto, llama leer_archivo antes de editar. "
+    "REGLA DE EDICIÓN: "
+    "Archivo COMPLETO en contexto → edita directo, no llames leer_archivo. "
+    "Archivo [TRUNCADO] en contexto → llama leer_archivo solo justo antes de editar_archivo (no antes). "
+    "Archivo NO en contexto → llama leer_archivo antes de editar. "
     "Nunca escribas texto_original de memoria — copia el texto exacto del contexto o del archivo leído. "
-    "EXCEPCIÓN post-edit: si hiciste editar_archivo sobre un archivo y necesitas editarlo OTRA VEZ "
-    "en el mismo turno, llama leer_archivo entre edits para obtener el contenido actualizado.\n"
-    "REGLA 3+ CAMBIOS: Si necesitas 3 o más modificaciones en el mismo archivo, usa crear_archivo "
-    "con el contenido completo reescrito — NO hagas N llamadas a editar_archivo.\n"
+    "Post-edit: el cache se actualiza automáticamente — NO releas el mismo archivo para el próximo edit en el mismo turno.\n"
+    "REGLA 3+ CAMBIOS — OBLIGATORIA: Si necesitas 3 o más modificaciones en el mismo archivo, "
+    "usa crear_archivo con el contenido COMPLETO reescrito en UNA sola llamada. "
+    "⛔ PROHIBIDO hacer N llamadas a editar_archivo cuando N≥3 — cada call es 1 iteración LLM (~30s). "
+    "Con crear_archivo: 1 call, 1 aprobación, mismo resultado, 3× más rápido.\n"
     "REGLA ejecutar_comando: Para ejecutar comandos de terminal (npm, pip, docker, kubectl, tests), "
     "usa ejecutar_comando(comando, motivo) — el sistema pedirá confirmación al usuario.\n"
     "REGLA PDF/IMPRESIÓN: Si el usuario menciona PDF, impresión, colores en PDF, "
     "header blanco, fondo que desaparece: llama diagnosticar_impresion() PRIMERO. "
-    "NUNCA busques en script.js el botón de descarga — el bug está en CSS @media print, no en JS de restauración."
+    "NUNCA busques en script.js el botón de descarga — el bug está en CSS @media print, no en JS de restauración.\n"
+    "REGLA CSS — ANTI-DUPLICADOS (crítica): Antes de agregar cualquier regla CSS "
+    "(::before, ::after, @media, o selector de clase/id), "
+    "llama buscar_en_proyecto(selector) para verificar si ya existe en el archivo. "
+    "Si ya existe → EDITA el bloque existente, NUNCA crees un segundo bloque. "
+    "CSS solo aplica la ÚLTIMA declaración cuando hay duplicados — el bug queda invisible. "
+    "Archivos CSS truncados en contexto: llama leer_archivo ANTES de editar — "
+    "el archivo real puede contener reglas que no ves en el contexto inyectado.\n"
+    "REGLA CSS — ARCHIVOS GRANDES: Si el CSS tiene más de 200 líneas y necesitas 2+ cambios, "
+    "usa crear_archivo con el contenido COMPLETO corregido en lugar de múltiples editar_archivo — "
+    "evita duplicados y es más confiable.\n"
+    "REGLA POST-EDICIÓN — VERIFICACIÓN: Después de editar_archivo, el resultado incluirá "
+    "la línea aproximada y el inicio del texto aplicado. Si el cambio es crítico (lógica, funciones, "
+    "selectores CSS clave), verifica con buscar_en_proyecto(texto_clave_del_cambio). "
+    "Si buscar_en_proyecto NO encuentra el texto → el edit no pegó: "
+    "usa crear_archivo con el archivo completo reescrito para garantizar el cambio."
 )
 
 
@@ -2239,59 +2283,116 @@ def correr_agente_zhipu(mensaje_usuario, imagenes=None):
 
     # Compactar historial automáticamente si es muy largo (causa respuestas lentas)
     _msgs_historial = [e for e in _historial if e["role"] in ("user", "assistant")]
-    if len(_msgs_historial) > 20:
+    if len(_msgs_historial) > 16:
         print(f"[Historial largo ({len(_msgs_historial)} mensajes) — compactando automáticamente para acelerar...]")
         _historial.pop()  # quitar el mensaje que acabamos de agregar antes de compactar
         resultado_compact = compactar_historial()
         print(f"[{resultado_compact}]")
         _historial.append({"role": "user", "content": mensaje_usuario})
         _msgs_historial = [e for e in _historial if e["role"] in ("user", "assistant")]
-    elif len(_msgs_historial) > 14:
+    elif len(_msgs_historial) > 10:
         print(f"[⚠ Historial largo: {len(_msgs_historial)} mensajes — usa /compact para acelerar respuestas]")
 
+    # Truncar historial: mantener últimas 12 entradas para no saturar contexto (igual que claude-code)
+    MAX_HIST = 12
+    _msgs_historial_truncado = _msgs_historial if len(_msgs_historial) <= MAX_HIST else _msgs_historial[-MAX_HIST:]
     messages = [{"role": "system", "content": SYSTEM_PROMPT + _ZHIPU_ACTION_SUFFIX}]
-    messages += [{"role": e["role"], "content": e["content"]} for e in _msgs_historial]
+    messages += [{"role": e["role"], "content": e["content"]} for e in _msgs_historial_truncado]
 
-    # Inyectar archivos en cache como contexto sintético — evita leer_archivo y listar_archivos
-    if _CACHE_ARCHIVOS and RUTA_PROYECTO[0]:
+    # ── Inyección de contexto del proyecto ──────────────────────────────────────
+    # Dos capas separadas para mantener el primer LLM call ligero:
+    #   1. _CACHE_INDEX  → índice compacto (nombres + tamaños). Siempre presente.
+    #      ~100-300 chars independientemente del número de archivos.
+    #   2. _CACHE_ARCHIVOS → contenido real de archivos explícitamente leídos.
+    #      Solo crece cuando leer_archivo es llamado. Cero en el primer turno.
+    if RUTA_PROYECTO[0]:
         _base_cache = os.path.abspath(RUTA_PROYECTO[0])
-        _lineas_cache = []
-        _nombres_cache = []
-        for _ruta_abs_c, _cont_c in _CACHE_ARCHIVOS.items():
-            try:
-                _rel_c = os.path.relpath(_ruta_abs_c, _base_cache)
-            except ValueError:
-                _rel_c = _ruta_abs_c
-            _nombres_cache.append(_rel_c)
-            # Truncar a 1500 chars por archivo — suficiente para entender estructura
-            # El LLM puede llamar leer_archivo para el contenido completo si lo necesita
-            _lineas_cache.append(f"--- {_rel_c} ---\n{_cont_c[:1500]}" + (" [truncado]" if len(_cont_c) > 1500 else ""))
-        if _lineas_cache:
-            _lista_nombres = ", ".join(_nombres_cache)
-            _cache_bloque = "\n\n".join(_lineas_cache)
+
+        # --- Capa 1: índice compacto ---
+        if _CACHE_INDEX:
+            _idx_lineas = []
+            for _fp, _meta in _CACHE_INDEX.items():
+                _idx_lineas.append(f"  {_meta['rel']} ({_meta['lines']} líneas / {_meta['chars']} chars)")
+            _idx_bloque = "\n".join(_idx_lineas)
             messages.insert(1, {
                 "role": "user",
                 "content": (
-                    f"[PROYECTO EN CONTEXTO: {_lista_nombres}]\n"
-                    f"PROHIBIDO usar leer_archivo o listar_archivos — los archivos ya están completos abajo. "
-                    f"Usarlos desperdicia iteraciones y es un error. Lee directamente de aquí:\n\n"
-                    + _cache_bloque
+                    f"[PROYECTO — archivos disponibles en {_base_cache}]\n"
+                    f"NUNCA llames listar_archivos — ya tienes el listado aquí.\n"
+                    f"Para editar un archivo: llama leer_archivo primero si no está en el contexto leído abajo.\n\n"
+                    + _idx_bloque
                 )
             })
             messages.insert(2, {
                 "role": "assistant",
                 "content": (
-                    f"Proyecto cargado. Tengo en memoria: {_lista_nombres}. "
-                    "No llamaré listar_archivos ni leer_archivo — tengo todo el contenido aquí y lo usaré directamente."
+                    f"Proyecto indexado: {len(_CACHE_INDEX)} archivos disponibles. "
+                    f"Leeré solo los que necesite según el pedido del usuario."
                 )
             })
 
+        # --- Capa 2: contenido de archivos explícitamente leídos ---
+        if _CACHE_ARCHIVOS:
+            _lineas_completos = []
+            _lineas_truncados = []
+            _nombres_completos = []
+            _nombres_truncados = []
+            for _ruta_abs_c, _cont_c in _CACHE_ARCHIVOS.items():
+                try:
+                    _rel_c = os.path.relpath(_ruta_abs_c, _base_cache)
+                except ValueError:
+                    _rel_c = _ruta_abs_c
+                _total_chars = len(_cont_c)
+                _total_lineas = _cont_c.count('\n') + 1
+                if _total_chars <= 1500:
+                    _nombres_completos.append(_rel_c)
+                    _lineas_completos.append(f"--- {_rel_c} ---\n{_cont_c}")
+                else:
+                    _nombres_truncados.append(_rel_c)
+                    _lineas_truncados.append(
+                        f"--- {_rel_c} [TRUNCADO: {_total_chars} chars | {_total_lineas} líneas] ---\n"
+                        f"{_cont_c[:1500]}"
+                    )
+            _todas_lineas = _lineas_completos + _lineas_truncados
+            _todos_nombres = _nombres_completos + _nombres_truncados
+            if _todas_lineas:
+                _lista_nombres = ", ".join(_todos_nombres)
+                _cache_bloque = "\n\n".join(_todas_lineas)
+                _aviso_completos = (
+                    f"Archivos COMPLETOS (edita directo sin leer_archivo): {', '.join(_nombres_completos)}. "
+                    if _nombres_completos else ""
+                )
+                _aviso_truncados = (
+                    f"Archivos TRUNCADOS (llama leer_archivo justo antes de editar): "
+                    f"{', '.join(_nombres_truncados)}. "
+                    if _nombres_truncados else ""
+                )
+                _insert_pos = 3 if _CACHE_INDEX else 1
+                messages.insert(_insert_pos, {
+                    "role": "user",
+                    "content": (
+                        f"[CONTENIDO LEÍDO: {_lista_nombres}]\n"
+                        f"{_aviso_completos}"
+                        f"{_aviso_truncados}\n\n"
+                        + _cache_bloque
+                    )
+                })
+                messages.insert(_insert_pos + 1, {
+                    "role": "assistant",
+                    "content": (
+                        f"Contenido en memoria: {_lista_nombres}. "
+                        + (_aviso_completos or "") + (_aviso_truncados or "")
+                    )
+                })
+
     import zai as _zai
-    MAX_ITER = 18
+    MAX_ITER = 12  # reducido de 18: flujo típico CSS+JS requiere ≤10 iteraciones
     respuesta_final = ""
     tools_openai = _tools_a_openai()
     tool_log = []
     _ya_compacto = False
+    _aprobacion_pendiente = False   # True tras pedir_confirmacion → APROBADO
+    _correcciones_sin_tools = 0     # cuántas veces ya se inyectó corrección (máx 2)
 
     for _iter in range(MAX_ITER):
         if _detener_agente.is_set():
@@ -2354,6 +2455,53 @@ def correr_agente_zhipu(mensaje_usuario, imagenes=None):
                     f"  Intenta reiniciar la conversación o reducir el historial."
                 )
                 break
+
+            # ── Detector "describe pero no actúa" ──────────────────────────────
+            # El LLM a veces genera texto describiendo cambios en lugar de llamar tools.
+            # Detectar y forzar corrección si: (A) viene de una aprobación pendiente,
+            # o (B) la respuesta contiene bloques de código + keywords de acción.
+            _debe_corregir = False
+            if _correcciones_sin_tools < 2 and _iter < MAX_ITER - 1 and not _detener_agente.is_set():
+                _content_lower = content.lower()
+                if _aprobacion_pendiente:
+                    # Caso A: plan fue aprobado, esperábamos tool calls
+                    _debe_corregir = True
+                    _razon_correccion = "plan aprobado pero se generó texto en lugar de tool calls"
+                elif (
+                    "```" in content  # hay bloques de código (con o sin tools previas)
+                    and any(w in _content_lower for w in [
+                        "editar_archivo", "crear_archivo", "leer_archivo",
+                        ".css", ".js", ".html", ".py", ".ts",
+                        "voy a ", "voy a editar", "editaré", "modificaré", "realizaré",
+                        "he modificado", "he corregido", "he actualizado", "cambié", "agregué",
+                    ])
+                    and not any(w in _content_lower[:80] for w in [
+                        "error", "rechaz", "no puedo", "no se puede", "listo", "completé", "terminé",
+                    ])
+                ):
+                    # Caso B: código en texto sin tool calls — incluye primer call del turno
+                    _debe_corregir = True
+                    _razon_correccion = (
+                        "primer call con código en texto sin tool calls"
+                        if not tool_log else
+                        "respuesta con código/archivos pero sin tool calls ejecutados"
+                    )
+
+            if _debe_corregir:
+                _correcciones_sin_tools += 1
+                _aprobacion_pendiente = False
+                print(f"[⚠ Corrección #{_correcciones_sin_tools}: {_razon_correccion}]")
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": (
+                    "STOP — describiste cambios en texto pero no llamaste ninguna herramienta. "
+                    "El usuario quiere resultados, no explicaciones. "
+                    "Llama editar_archivo o crear_archivo AHORA para aplicar los cambios. "
+                    "Ejecuta TODAS las modificaciones en esta respuesta, sin más texto previo."
+                )})
+                continue
+            # ────────────────────────────────────────────────────────────────────
+
+            _aprobacion_pendiente = False
             respuesta_final = content
             print("\nAgente:", respuesta_final)
             messages.append({"role": "assistant", "content": content})
@@ -2398,6 +2546,9 @@ def correr_agente_zhipu(mensaje_usuario, imagenes=None):
             print(f"[Herramienta: {nombre}]")
             resultado = ejecutar_herramienta(nombre, inputs_tc)
             resultado_str = str(resultado)
+            # Detectar aprobación — próxima respuesta sin tools es un error
+            if nombre == "pedir_confirmacion" and "APROBADO" in resultado_str:
+                _aprobacion_pendiente = True
             if nombre in _SILENCIOSAS:
                 tool_log.append(f"{nombre} → (silencioso)")
             elif nombre == "leer_archivo":
@@ -2406,7 +2557,15 @@ def correr_agente_zhipu(mensaje_usuario, imagenes=None):
             else:
                 preview = resultado_str[:300] + ("…" if len(resultado_str) > 300 else "")
                 print(f"[→ {preview}]")
-                tool_log.append(f"{nombre}({json.dumps(inputs_tc, ensure_ascii=False, default=str)}) → {resultado_str[:400]}")
+                # Log legible: para editar/crear mostrar solo nombre de archivo, no el contenido completo
+                if nombre in ("editar_archivo", "crear_archivo"):
+                    _archivo_log = inputs_tc.get("ruta_relativa", "?")
+                    tool_log.append(f"{nombre}({_archivo_log}) → {resultado_str[:120]}")
+                else:
+                    _inputs_preview = json.dumps(inputs_tc, ensure_ascii=False, default=str)
+                    if len(_inputs_preview) > 80:
+                        _inputs_preview = _inputs_preview[:80] + "…"
+                    tool_log.append(f"{nombre}({_inputs_preview}) → {resultado_str[:120]}")
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -2417,30 +2576,19 @@ def correr_agente_zhipu(mensaje_usuario, imagenes=None):
         if MODO_ACTUAL != _modo_antes:
             messages[0] = {"role": "system", "content": SYSTEM_PROMPT + _ZHIPU_ACTION_SUFFIX}
 
-    # Si el loop agotó iteraciones con tool calls pero sin texto final → generar resumen
+    # Si el loop agotó iteraciones sin texto final → resumen compacto sin LLM extra
     if not respuesta_final and tool_log and not _detener_agente.is_set():
-        try:
-            print("[Generando resumen de acciones...]")
-            _msgs_resumen = messages + [{
-                "role": "user",
-                "content": (
-                    "Resume brevemente (2-4 oraciones) qué cambios realizaste y si quedó alguna tarea pendiente. "
-                    "Solo el resumen, sin preguntas."
-                )
-            }]
-            _resp_res = client.chat.completions.create(
-                model=MODELO,
-                messages=_msgs_resumen,
-                max_tokens=350,
-                temperature=0.3,
-            )
-            _texto_res = (_resp_res.choices[0].message.content or "").strip()
-            _texto_res = re.sub(r"<think>.*?</think>", "", _texto_res, flags=re.DOTALL).strip()
-            if _texto_res:
-                respuesta_final = _texto_res
-                print("\nAgente:", respuesta_final)
-        except Exception as _e_res:
-            print(f"[Error generando resumen: {_e_res}]")
+        # Construir resumen legible: contar edits por archivo
+        _edits = [t for t in tool_log if t.startswith("editar_archivo") or t.startswith("crear_archivo")]
+        _archivos_mod = list(dict.fromkeys(
+            t.split("(")[1].split(")")[0] for t in _edits
+        ))
+        if _archivos_mod:
+            respuesta_final = f"Listo. Cambios aplicados en: {', '.join(_archivos_mod)}."
+        else:
+            acciones = "\n".join(f"  • {t}" for t in tool_log[-4:])
+            respuesta_final = f"Listo.\n{acciones}"
+        print("\nAgente:", respuesta_final)
 
     # Guardar resumen de tools al historial para contexto del próximo turno
     if tool_log:
@@ -2721,33 +2869,41 @@ _CACHE_MAX_FILES = 12       # límite de archivos por proyecto
 
 
 def _poblar_cache_proyecto(ruta_dir):
-    """Lee todos los archivos de texto del proyecto al cache. Llamar tras definir RUTA_PROYECTO."""
+    """Construye índice ligero del proyecto (metadatos, sin leer contenido).
+    El contenido se carga solo cuando leer_archivo es llamado explícitamente.
+    Esto evita inyectar miles de tokens en el primer LLM call."""
     if not ruta_dir or not os.path.isdir(ruta_dir):
         return
     base = os.path.abspath(ruta_dir)
-    cargados = 0
+    _CACHE_INDEX.clear()
+    indexados = 0
     omitidos = []
     for root, dirs, files in os.walk(base):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv")]
         for fname in sorted(files):
-            if cargados >= _CACHE_MAX_FILES:
+            if indexados >= _CACHE_MAX_FILES:
                 break
             ext = os.path.splitext(fname)[1].lower()
             if ext not in _EXTS_TEXTO:
                 continue
             fpath = os.path.join(root, fname)
-            if os.path.getsize(fpath) > _CACHE_MAX_BYTES:
+            fsize = os.path.getsize(fpath)
+            if fsize > _CACHE_MAX_BYTES:
                 omitidos.append(fname)
                 continue
             try:
+                # Contar líneas sin leer todo el archivo en memoria
                 with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                    contenido = f.read()
-                _CACHE_ARCHIVOS[fpath] = contenido
-                _ARCHIVOS_LEIDOS.add(fpath)
-                cargados += 1
+                    nlines = sum(1 for _ in f)
+                _CACHE_INDEX[fpath] = {
+                    "rel": os.path.relpath(fpath, base),
+                    "chars": fsize,
+                    "lines": nlines,
+                }
+                indexados += 1
             except OSError:
                 pass
-    resumen = f"[Cache: {cargados} archivos cargados"
+    resumen = f"[Índice: {indexados} archivos"
     if omitidos:
         resumen += f" | omitidos por tamaño: {', '.join(omitidos)}"
     resumen += "]"
@@ -2763,8 +2919,8 @@ def _precargar_ruta(mensaje_usuario=""):
     if MODO_ACTUAL == "default":
         return
     if RUTA_PROYECTO[0] and os.path.isdir(RUTA_PROYECTO[0]):
-        # Poblar cache si aún está vacío (primera vez en esta sesión)
-        if not _CACHE_ARCHIVOS:
+        # Indexar proyecto si el índice está vacío (primera vez en esta sesión)
+        if not _CACHE_INDEX:
             _poblar_cache_proyecto(RUTA_PROYECTO[0])
         return  # ya definida en esta sesión
     # Sin ruta en sesión → pedir ahora, sin gastar 1 LLM call
@@ -3496,7 +3652,8 @@ if __name__ == "__main__":
             n = len(_CACHE_ARCHIVOS)
             _CACHE_ARCHIVOS.clear()
             _ARCHIVOS_LEIDOS.clear()
-            agregar_texto(f"Sistema: Cache limpiado — {n} archivos eliminados de memoria.\n\n", "sistema")
+            _CACHE_INDEX.clear()
+            agregar_texto(f"Sistema: Cache limpiado — {n} archivos eliminados de memoria. Índice reiniciado.\n\n", "sistema")
             return
 
         # Procesar adjuntos: extraer texto/base64 y limpiar lista
@@ -3529,19 +3686,11 @@ if __name__ == "__main__":
             import time as _time
             _n_msgs[0] = 0
             builtins.print = print_a_cola
-            _es_creacion = _detectar_intencion_creacion(texto_final)
-            _texto_para_agente = texto_final
             _t_inicio = _time.perf_counter()
             try:
-                if _es_creacion:
-                    msg_queue.put(("sistema", "✨ Enriqueciendo solicitud...\n"))
-                    _t_enrich = _time.perf_counter()
-                    _enriquecido = _enriquecer_prompt_creacion(texto_final)
-                    _elapsed_enrich = _time.perf_counter() - _t_enrich
-                    if _enriquecido and _enriquecido != texto_final:
-                        _texto_para_agente = _enriquecido
-                        msg_queue.put(("sistema", f"📝 Prompt mejorado ⏱ {_elapsed_enrich:.1f}s — enviando al especialista...\n\n"))
-                correr_agente(_texto_para_agente, imagenes=_imgs)
+                # Enriquecimiento eliminado: consume 1 LLM call extra antes del agente.
+                # El agente principal tiene contexto suficiente para interpretar solicitudes de creación.
+                correr_agente(texto_final, imagenes=_imgs)
                 _elapsed = _time.perf_counter() - _t_inicio
                 if _n_msgs[0] == 0:
                     msg_queue.put(("sistema", f"Agente finalizó sin respuesta visible. Sin cambios realizados. ⏱ {_elapsed:.1f}s\n\n"))
